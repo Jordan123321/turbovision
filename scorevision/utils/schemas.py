@@ -1,4 +1,5 @@
 from math import floor
+from scorevision.utils.snooker_image import SnookerImagePrediction
 
 from pydantic import (
     AliasChoices,
@@ -159,7 +160,7 @@ class ChallengeRequest(BaseModel):
 class ChallengeResponse(BaseModel):
     challenge_id: str
     predictions: list[FramePrediction] | None = None
-    prediction: PredictionPayload | CricketDeliveryPrediction | TCGGradingPrediction | None = None
+    prediction: SnookerImagePrediction | PredictionPayload | CricketDeliveryPrediction | TCGGradingPrediction | None = None
     processing_time: float
 
     @model_validator(mode="before")
@@ -167,6 +168,10 @@ class ChallengeResponse(BaseModel):
     def parse_tcg_prediction(cls, data):
         if isinstance(data, dict):
             prediction = data.get("prediction")
+            if isinstance(prediction, dict) and prediction.get("type") == "snooker_image_primitives_v1":
+                data = dict(data)
+                data["prediction"] = SnookerImagePrediction(**prediction)
+                return data
             if (
                 isinstance(prediction, dict)
                 and "Header" in prediction
@@ -196,6 +201,8 @@ class ChallengeResponse(BaseModel):
 
     @property
     def prediction_count(self) -> int:
+        if isinstance(self.prediction, SnookerImagePrediction):
+            return len(self.prediction.balls)+len(self.prediction.pockets)+bool(self.prediction.surface)
         if isinstance(self.prediction, TCGGradingPrediction):
             return 5
         if isinstance(self.prediction, PredictionPayload) and self.prediction.type == "cricket_delivery":
@@ -212,10 +219,14 @@ class ChallengeResponse(BaseModel):
     def is_tcg_grading(self) -> bool:
         return isinstance(self.prediction, TCGGradingPrediction)
 
+    @property
+    def is_snooker_image(self) -> bool:
+        return isinstance(self.prediction, SnookerImagePrediction)
+
     @model_serializer(mode="wrap")
     def serialize_model(self, handler):
         data = handler(self)
-        if isinstance(self.prediction, TCGGradingPrediction):
+        if isinstance(self.prediction, (TCGGradingPrediction, SnookerImagePrediction)):
             return {
                 "challenge_id": data["challenge_id"],
                 "prediction": data["prediction"],

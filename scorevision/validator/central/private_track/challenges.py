@@ -10,6 +10,9 @@ from scorevision.utils.schemas import (
     TCGGradingPrediction,
 )
 from scorevision.utils.settings import get_settings
+from scorevision.utils.snooker_image import SnookerImagePrediction, SnookerImageGroundTruth, GROUNDTRUTH_TYPE
+
+IMAGE_TYPES = {"tcg_grading", GROUNDTRUTH_TYPE}
 
 logger = getLogger(__name__)
 
@@ -17,7 +20,7 @@ logger = getLogger(__name__)
 @dataclass
 class Challenge:
     challenge_id: str
-    ground_truth: list[FramePrediction] | CricketDeliveryPrediction | TCGGradingPrediction
+    ground_truth: list[FramePrediction] | CricketDeliveryPrediction | TCGGradingPrediction | SnookerImagePrediction
     groundtruth_type: str = "soccer_action"
     video_url: str | None = None
     image_url: str | None = None
@@ -25,9 +28,11 @@ class Challenge:
 
 
 def has_sufficient_actions(
-    ground_truth: list[FramePrediction] | CricketDeliveryPrediction | TCGGradingPrediction,
+    ground_truth: list[FramePrediction] | CricketDeliveryPrediction | TCGGradingPrediction | SnookerImagePrediction,
     groundtruth_type: str,
 ) -> bool:
+    if groundtruth_type == GROUNDTRUTH_TYPE:
+        return isinstance(ground_truth, SnookerImagePrediction) and bool(ground_truth.surface and ground_truth.pockets)
     if groundtruth_type in {"cricket_delivery", "tcg_grading"}:
         return True
     return len(ground_truth) >= get_settings().PRIVATE_MIN_ACTIONS_FOR_CHALLENGE
@@ -45,7 +50,7 @@ async def fetch_ground_truth(
     keypair,
     element_id: str | None = None,
     groundtruth_type: str = "soccer_action",
-) -> list[FramePrediction] | CricketDeliveryPrediction | TCGGradingPrediction:
+) -> list[FramePrediction] | CricketDeliveryPrediction | TCGGradingPrediction | SnookerImagePrediction:
     settings = get_settings()
     api_url = settings.PRIVATE_GT_API_URL or settings.SCOREVISION_API
     if not api_url:
@@ -61,6 +66,15 @@ async def fetch_ground_truth(
         )
         response.raise_for_status()
         data = response.json()
+
+    if groundtruth_type == GROUNDTRUTH_TYPE:
+        raw = data.get("ground_truth")
+        if not isinstance(raw, dict):
+            raise ValueError("Snooker image ground truth must be a primitive object")
+        result = SnookerImageGroundTruth(**raw)
+        if not has_sufficient_actions(result, groundtruth_type):
+            raise ValueError("Incomplete snooker image scoring ground truth")
+        return result
 
     if groundtruth_type == "cricket_delivery":
         raw = data.get("ground_truth", [])
@@ -137,20 +151,24 @@ async def get_challenge_with_ground_truth(
         challenge_id = chal.get("task_id") or chal.get("id")
         video_url = (
             chal.get("video_url")
-            or (chal.get("asset_url") if groundtruth_type != "tcg_grading" else None)
+            or (chal.get("asset_url") if groundtruth_type not in IMAGE_TYPES else None)
             or payload.get("video_url")
             or payload.get("clip_url")
         )
         image_url = (
             chal.get("image_url")
             or payload.get("image_url")
-            or (chal.get("asset_url") if groundtruth_type == "tcg_grading" else None)
-            or (chal.get("url") if groundtruth_type == "tcg_grading" else None)
-            or (payload.get("asset_url") if groundtruth_type == "tcg_grading" else None)
-            or (payload.get("url") if groundtruth_type == "tcg_grading" else None)
+            or (chal.get("asset_url") if groundtruth_type in IMAGE_TYPES else None)
+            or (chal.get("url") if groundtruth_type in IMAGE_TYPES else None)
+            or (payload.get("asset_url") if groundtruth_type in IMAGE_TYPES else None)
+            or (payload.get("url") if groundtruth_type in IMAGE_TYPES else None)
         )
         payload_frames_raw = _coerce_payload_frames(payload)
         payload_frames = [ChallengeFrame(**frame) for frame in payload_frames_raw] or None
+
+        if groundtruth_type == GROUNDTRUTH_TYPE and (not image_url or video_url or payload_frames):
+            logger.warning("Snooker primitive challenge requires exactly one image_url")
+            continue
 
         if not challenge_id or (not video_url and not image_url and not payload_frames):
             logger.warning(

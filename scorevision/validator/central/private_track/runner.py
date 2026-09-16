@@ -44,6 +44,8 @@ from scorevision.validator.central.scheduling import (
     update_element_state,
 )
 from scorevision.validator.models import PrivateEvaluationResult
+from scorevision.validator.central.private_track.snooker_image_scoring import score_snooker_image
+from scorevision.utils.snooker_image import GROUNDTRUTH_TYPE as SNOOKER_IMAGE_TYPE
 
 logger = logging.getLogger(__name__)
 
@@ -205,9 +207,9 @@ _PUBLIC_SHARD_FIELDS = {
 
 def _strip_for_public_shard(result: dict) -> dict:
     public_result = {k: v for k, v in result.items() if k in _PUBLIC_SHARD_FIELDS}
-    if result.get("groundtruth_type") == "tcg_grading":
+    if result.get("groundtruth_type") in {"tcg_grading", SNOOKER_IMAGE_TYPE}:
         public_result["element_id"] = result.get("element_id")
-        public_result["groundtruth_type"] = "tcg_grading"
+        public_result["groundtruth_type"] = result["groundtruth_type"]
     return public_result
 
 
@@ -329,7 +331,13 @@ async def _challenge_miner(
         benchmark_result = None
 
         if is_scored:
-            if challenge.groundtruth_type == "tcg_grading":
+            if challenge.groundtruth_type == SNOOKER_IMAGE_TYPE:
+                primitive_prediction = response.prediction if response.is_snooker_image else None
+                score, field_breakdown = score_snooker_image(primitive_prediction, challenge.ground_truth)
+                score_breakdown = {SNOOKER_IMAGE_TYPE: score, **field_breakdown}
+                pred_count = response.prediction_count if primitive_prediction else 0
+                response_predictions = [primitive_prediction.model_dump(mode="json")] if primitive_prediction else []
+            elif challenge.groundtruth_type == "tcg_grading":
                 tcg_prediction = response.prediction if response.is_tcg_grading else None
                 score, field_breakdown = score_tcg_grading_with_breakdown(
                     tcg_prediction,

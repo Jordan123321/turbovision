@@ -64,6 +64,7 @@ class PillarName(str, Enum):
     SOCCER_ACTION = "soccer_action"
     CRICKET_SCORING = "cricket_scoring"
     TCG_GRADING = "tcg_grading"
+    SNOOKER_IMAGE_PRIMITIVES_V1 = "snooker_image_primitives_v1"
     FALSE_POSITIVE = "false_positive"
 
 
@@ -88,12 +89,14 @@ class ChallengeType(str, Enum):
     FOOTBALL = "football"
     CRICKET = "cricket"
     BASKETBALL = "basketball"
+    SNOOKER = "snooker"
 
 
 class GroundTruthType(str, Enum):
     SOCCER_ACTION = "soccer_action"
     CRICKET_DELIVERY = "cricket_delivery"
     TCG_GRADING = "tcg_grading"
+    SNOOKER_IMAGE_PRIMITIVES_V1 = "snooker_image_primitives_v1"
 
 
 # ------------------------------------------------------------

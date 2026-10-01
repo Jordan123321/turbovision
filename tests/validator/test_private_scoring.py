@@ -159,7 +159,7 @@ def test_register_pillar_scorer_dispatches_custom_pillar():
         assert breakdown["rugby_action"] == 0.42
 
 
-def test_cricket_scoring_top6_fields_perfect_match():
+def test_cricket_scoring_core_fields_perfect_match():
     prediction = CricketDeliveryPrediction(
         kph=130.0,
         bounce_x=6.0,
@@ -170,9 +170,8 @@ def test_cricket_scoring_top6_fields_perfect_match():
     )
     score, breakdown = score_cricket_prediction_with_breakdown(prediction, prediction)
 
-    # Only the 6 heaviest-weight fields are present in this fixture.
-    # Their total weight is 0.80, so a perfect match on those fields yields 0.80.
-    assert score == pytest.approx(0.80)
+    # These six core fields now account for 56% of the score.
+    assert score == pytest.approx(0.56)
     assert breakdown["kph"] == 1.0
 
 
@@ -188,11 +187,39 @@ def test_cricket_scoring_uses_updated_private_track_field_weights():
 
     bounce_only = CricketDeliveryPrediction(bounce_x=6.0)
     score, _ = score_cricket_prediction_with_breakdown(bounce_only, ground_truth)
-    assert score == pytest.approx(0.23)
+    assert score == pytest.approx(0.10)
 
     kph_only = CricketDeliveryPrediction(kph=130.0)
     score, _ = score_cricket_prediction_with_breakdown(kph_only, ground_truth)
-    assert score == pytest.approx(0.04)
+    assert score == pytest.approx(0.10)
+
+
+def test_cricket_scoring_field_weight_distribution():
+    assert _CRICKET_FIELD_WEIGHTS == {
+        "match": 0.0,
+        "matchid": 0.0,
+        "inningsid": 0.0,
+        "overid": 0.0,
+        "ball_in_over": 0.0,
+        "ballid": 0.0,
+        "xlsx_overs": 0.0,
+        "scorecard_overs": 0.0,
+        "kph": 0.10,
+        "bounce_x": 0.10,
+        "stump_y": 0.10,
+        "deviation": 0.08,
+        "swing_angle": 0.08,
+        "stump_z": 0.10,
+        "release_y": 0.08,
+        "release_z": 0.08,
+        "bounce_y": 0.05,
+        "impact_x": 0.10,
+        "impact_y": 0.08,
+        "impact_z": 0.05,
+        "interception_distance": 0.0,
+        "runs": 0.0,
+        "wickets": 0.0,
+    }
 
 
 def test_cricket_scoring_identifiers_and_outcomes_have_zero_weight():

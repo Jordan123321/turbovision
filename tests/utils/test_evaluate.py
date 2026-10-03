@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 from scorevision.utils.evaluate import (
     post_vlm_ranking,
     get_element_scores,
@@ -36,6 +38,38 @@ def test_post_vlm_ranking(
     assert isinstance(evaluation.details, dict)
     assert evaluation.latency_ms == 0.0
     assert evaluation.acc > 0.0
+
+
+def test_post_vlm_ranking_does_not_gate_chutes_latency(
+    dummy_manifest,
+    dummy_pseudo_gt_annotations,
+    fake_miner_predictions,
+    fake_payload,
+    fake_challenge,
+    fake_frame_store,
+) -> None:
+    slow_miner_predictions = replace(
+        fake_miner_predictions,
+        latency_ms=60_000.0,
+        latency_p95_ms=60_000.0,
+    )
+    element_id = dummy_manifest.elements[0].id
+
+    evaluation = post_vlm_ranking(
+        payload=fake_payload,
+        miner_run=slow_miner_predictions,
+        challenge=fake_challenge,
+        pseudo_gt_annotations=dummy_pseudo_gt_annotations,
+        frame_store=fake_frame_store,
+        manifest=dummy_manifest,
+        element_id=element_id,
+    )
+
+    assert evaluation.score > 0.0
+    assert evaluation.latency_p95_ms == 60_000.0
+    assert evaluation.latency_pass is True
+    assert evaluation.rtf is None
+    assert evaluation.details["latency"]["service_rate_fps"] == 30
 
 
 def test_get_element_scores(
@@ -201,3 +235,35 @@ def test_parse_miner_prediction_prefers_score_over_conf():
     bboxes = parsed[9]["bboxes"]
 
     assert bboxes[0].score == 0.77
+
+
+def test_parse_miner_prediction_parses_points_only_polygons():
+    miner_run = SVRunOutput(
+        success=True,
+        latency_ms=0.0,
+        predictions={
+            "frames": [
+                {
+                    "frame_id": 4,
+                    "polygons": [
+                        {
+                            "cls_id": 0,
+                            "points": [(2, 3), (12, 3), (12, 15), (2, 15)],
+                            "conf": 0.88,
+                        }
+                    ],
+                    "keypoints": [],
+                }
+            ]
+        },
+        error=None,
+        model=None,
+    )
+
+    parsed = parse_miner_prediction(miner_run=miner_run, object_names=["player"])
+    polygons = parsed[4]["polygons"]
+
+    assert len(polygons) == 1
+    assert polygons[0].polygon == [(2, 3), (12, 3), (12, 15), (2, 15)]
+    assert polygons[0].bbox_2d == (2, 3, 12, 15)
+    assert polygons[0].score == 0.88

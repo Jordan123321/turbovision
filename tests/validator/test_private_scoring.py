@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from scorevision.validator.central.private_track.scoring import (
+    _CRICKET_FIELD_WEIGHTS,
     calculate_time_decay,
     find_best_match,
     frame_to_seconds,
@@ -12,6 +13,7 @@ from scorevision.validator.central.private_track.scoring import (
     score_predictions,
     score_predictions_for_pillar,
     score_predictions_with_breakdown,
+    score_tcg_grading_with_breakdown,
 )
 from scorevision.utils.schemas import (
     CricketDeliveryPrediction,
@@ -19,6 +21,7 @@ from scorevision.utils.schemas import (
     SnookerBallPrediction,
     SnookerBallStateFrame,
     SnookerBallStatePrediction,
+    TCGGradingPrediction,
 )
 
 
@@ -160,7 +163,7 @@ def test_register_pillar_scorer_dispatches_custom_pillar():
         assert breakdown["rugby_action"] == 0.42
 
 
-def test_cricket_scoring_top6_fields_perfect_match():
+def test_cricket_scoring_core_fields_perfect_match():
     prediction = CricketDeliveryPrediction(
         kph=130.0,
         bounce_x=6.0,
@@ -171,9 +174,8 @@ def test_cricket_scoring_top6_fields_perfect_match():
     )
     score, breakdown = score_cricket_prediction_with_breakdown(prediction, prediction)
 
-    # Only the 6 heaviest-weight fields are present in this fixture.
-    # Their total weight is 0.74, so a perfect match on those fields yields 0.74.
-    assert score == pytest.approx(0.74)
+    # These six core fields now account for 56% of the score.
+    assert score == pytest.approx(0.56)
     assert breakdown["kph"] == 1.0
 
 
@@ -561,3 +563,130 @@ def test_snooker_ball_state_penalizes_duplicate_target_frame_objects():
     assert score < 1.0
     assert breakdown["false_positive_score"] < 1.0
     assert breakdown["snooker_ball_state"] == pytest.approx(score)
+
+
+def test_cricket_scoring_uses_updated_private_track_field_weights():
+    ground_truth = CricketDeliveryPrediction(
+        kph=130.0,
+        bounce_x=6.0,
+        stump_y=0.2,
+        deviation=1.0,
+        swing_angle=-0.5,
+        stump_z=0.8,
+    )
+
+    bounce_only = CricketDeliveryPrediction(bounce_x=6.0)
+    score, _ = score_cricket_prediction_with_breakdown(bounce_only, ground_truth)
+    assert score == pytest.approx(0.10)
+
+    kph_only = CricketDeliveryPrediction(kph=130.0)
+    score, _ = score_cricket_prediction_with_breakdown(kph_only, ground_truth)
+    assert score == pytest.approx(0.10)
+
+
+def test_cricket_scoring_field_weight_distribution():
+    assert _CRICKET_FIELD_WEIGHTS == {
+        "match": 0.0,
+        "matchid": 0.0,
+        "inningsid": 0.0,
+        "overid": 0.0,
+        "ball_in_over": 0.0,
+        "ballid": 0.0,
+        "xlsx_overs": 0.0,
+        "scorecard_overs": 0.0,
+        "kph": 0.10,
+        "bounce_x": 0.10,
+        "stump_y": 0.10,
+        "deviation": 0.08,
+        "swing_angle": 0.08,
+        "stump_z": 0.10,
+        "release_y": 0.08,
+        "release_z": 0.08,
+        "bounce_y": 0.05,
+        "impact_x": 0.10,
+        "impact_y": 0.08,
+        "impact_z": 0.05,
+        "interception_distance": 0.0,
+        "runs": 0.0,
+        "wickets": 0.0,
+    }
+
+
+def test_cricket_scoring_identifiers_and_outcomes_have_zero_weight():
+    prediction = CricketDeliveryPrediction(
+        match="match-a",
+        matchid=10,
+        inningsid=1,
+        overid=4,
+        ball_in_over=2,
+        ballid=20,
+        xlsx_overs="4.2",
+        scorecard_overs="4.2",
+        runs=3,
+        wickets=1,
+    )
+
+    score, breakdown = score_cricket_prediction_with_breakdown(prediction, prediction)
+
+    assert score == 0.0
+    zero_weight_fields = {
+        "match",
+        "matchid",
+        "inningsid",
+        "overid",
+        "ball_in_over",
+        "ballid",
+        "xlsx_overs",
+        "scorecard_overs",
+        "runs",
+        "wickets",
+    }
+    assert all(breakdown[field] == 1.0 for field in zero_weight_fields)
+
+
+def test_cricket_field_weights_sum_to_one():
+    assert sum(_CRICKET_FIELD_WEIGHTS.values()) == pytest.approx(1.0)
+
+
+def _tcg_prediction(
+    *,
+    surface: float = 6.0,
+    centering: float = 10.0,
+    edges: float = 9.0,
+    corners: float = 8.0,
+    card_grade: float = 7.0,
+) -> TCGGradingPrediction:
+    return TCGGradingPrediction(
+        Header={"card_grade": card_grade},
+        Grading_Features={
+            "subgrade_surface": surface,
+            "subgrade_centering": centering,
+            "subgrade_edges": edges,
+            "subgrade_corners": corners,
+        },
+    )
+
+
+def test_tcg_grading_perfect_prediction_scores_one():
+    ground_truth = _tcg_prediction()
+    score, breakdown = score_tcg_grading_with_breakdown(ground_truth, ground_truth)
+
+    assert score == 1.0
+    assert all(field_score == 1.0 for field_score in breakdown.values())
+
+
+def test_tcg_grading_uses_requested_weights_and_linear_distance():
+    ground_truth = _tcg_prediction()
+    prediction = _tcg_prediction(surface=7.0)
+
+    score, breakdown = score_tcg_grading_with_breakdown(prediction, ground_truth)
+
+    assert breakdown["subgrade_surface"] == 0.5
+    assert score == pytest.approx(0.875)
+
+
+def test_tcg_grading_missing_prediction_scores_zero():
+    score, breakdown = score_tcg_grading_with_breakdown(None, _tcg_prediction())
+
+    assert score == 0.0
+    assert all(field_score == 0.0 for field_score in breakdown.values())

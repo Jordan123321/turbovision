@@ -7,6 +7,7 @@ from scorevision.utils.schemas import (
     SnookerBallPrediction,
     SnookerBallStateFrame,
     SnookerBallStatePrediction,
+    TCGGradingPrediction,
 )
 from scorevision.validator.central.private_track.challenges import Challenge
 from scorevision.validator.central.private_track.miners import ChallengeAttempt
@@ -35,6 +36,23 @@ def _challenge() -> Challenge:
         challenge_id="challenge-1",
         video_url="https://example.com/video.mp4",
         ground_truth=[FramePrediction(frame=25, action="pass")],
+    )
+
+
+def _tcg_challenge() -> Challenge:
+    return Challenge(
+        challenge_id="tcg-1",
+        image_url="https://example.com/card.png",
+        ground_truth=TCGGradingPrediction(
+            Header={"card_grade": 6.0},
+            Grading_Features={
+                "subgrade_surface": 5.0,
+                "subgrade_centering": 10.0,
+                "subgrade_edges": 9.0,
+                "subgrade_corners": 9.0,
+            },
+        ),
+        groundtruth_type="tcg_grading",
     )
 
 
@@ -135,6 +153,58 @@ async def test_challenge_miner_excludes_timeout_from_weights():
     assert result["prediction_count"] == 0
     assert result["timed_out"] is True
     assert response_predictions is None
+    assert benchmark_result is None
+
+
+@pytest.mark.asyncio
+async def test_challenge_miner_scores_tcg_grading_response():
+    attempt = ChallengeAttempt(
+        response=ChallengeResponse(
+            challenge_id="tcg-1",
+            prediction={
+                "Header": {"card_grade": 6.0},
+                "Grading_Features": {
+                    "subgrade_surface": 5.0,
+                    "subgrade_centering": 10.0,
+                    "subgrade_edges": 9.0,
+                    "subgrade_corners": 9.0,
+                },
+            },
+            processing_time=1.2,
+        ),
+        elapsed_s=1.5,
+        timed_out=False,
+    )
+
+    with patch(
+        "scorevision.validator.central.private_track.runner.send_challenge",
+        new=AsyncMock(return_value=attempt),
+    ):
+        result, response_predictions, benchmark_result = await _challenge_miner(
+            miner=_miner(),
+            challenge=_tcg_challenge(),
+            keypair=None,
+            timeout=30.0,
+            block=1234,
+            element_id="manako/TCGGrading",
+            pillar_weights={"tcg_grading": 1.0},
+            image_digest="sha256:abc123",
+        )
+
+    assert result["score"] == 1.0
+    assert result["prediction_count"] == 5
+    assert result["score_breakdown"]["tcg_grading"] == 1.0
+    assert response_predictions == [
+        {
+            "Header": {"card_grade": 6},
+            "Grading_Features": {
+                "subgrade_surface": 5,
+                "subgrade_centering": 10,
+                "subgrade_edges": 9,
+                "subgrade_corners": 9,
+            },
+        }
+    ]
     assert benchmark_result is None
 
 

@@ -6,6 +6,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from json import dumps
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Dict, Optional
 import httpx
 from scorevision.miner.open_source.chute_template.schemas import TVFrame, TVPredictInput
@@ -22,7 +23,7 @@ from scorevision.validator.central.private_track.challenges import (
     Challenge,
     get_challenge_with_ground_truth,
 )
-from scorevision.validator.central.private_track.miners import send_challenge
+from scorevision.validator.central.private_track.miners import ChallengeAttempt, send_challenge
 from scorevision.validator.central.private_track.registry import RegisteredMiner, get_registered_miners
 from scorevision.validator.central.private_track.benchmark import (
     BenchmarkResult,
@@ -33,11 +34,13 @@ from scorevision.validator.central.private_track.scoring import (
     score_cricket_prediction_with_breakdown,
     score_snooker_ball_state_with_breakdown,
     score_predictions_with_breakdown,
+    score_tcg_grading_with_breakdown,
 )
 from scorevision.validator.central.private_track.spotcheck import PendingSpotcheck
 from scorevision.validator.central.scheduling import (
     cancel_removed_element_tasks,
     extract_element_tempos,
+    get_due_trigger_block,
     load_manifest,
     setup_shutdown_handler,
     update_element_state,
@@ -64,9 +67,25 @@ def _emit_shard_concurrency() -> int:
 _EMIT_SHARD_SEM = asyncio.Semaphore(_emit_shard_concurrency())
 
 
-async def _run_guarded(coro):
+async def _run_guarded(coro, *, label: str = "private"):
+    queued_at = perf_counter()
     async with _EMIT_SHARD_SEM:
-        return await coro
+        acquired_at = perf_counter()
+        logger.info(
+            "[emit-queue:%s] status=acquired wait_ms=%.1f concurrency=%d",
+            label,
+            (acquired_at - queued_at) * 1000.0,
+            _emit_shard_concurrency(),
+        )
+        try:
+            return await coro
+        finally:
+            logger.info(
+                "[emit-queue:%s] status=released hold_ms=%.1f concurrency=%d",
+                label,
+                (perf_counter() - acquired_at) * 1000.0,
+                _emit_shard_concurrency(),
+            )
 
 
 def _ground_truth_count(challenge: Challenge) -> int:
@@ -106,7 +125,14 @@ def _private_responses_r2_config() -> R2Config:
     )
 
 
-async def _upload_to_private_r2(key: str, index_key: str, payload: dict, label: str) -> str | None:
+async def _upload_to_private_r2(
+    key: str,
+    index_key: str,
+    payload: dict,
+    label: str,
+    *,
+    trace_id: str,
+) -> str | None:
     cfg = _private_responses_r2_config()
     if not (cfg.bucket and cfg.account_id and cfg.access_key_id and cfg.secret_access_key):
         logger.warning("%sPrivate R2 not configured, skipping upload of %s", LOG_PREFIX, label)
@@ -115,22 +141,47 @@ async def _upload_to_private_r2(key: str, index_key: str, payload: dict, label: 
     client_factory = lambda: create_s3_client(cfg, error_message="Private R2 is not configured")
     try:
         async def _upload():
+            serialize_started = perf_counter()
+            logger.info("[emit:%s] stage=object_serialize status=start", trace_id)
+            body = dumps(payload, separators=(",", ":"))
+            body_bytes = len(body.encode())
+            logger.info(
+                "[emit:%s] stage=object_serialize status=done duration_ms=%.1f bytes=%d",
+                trace_id,
+                (perf_counter() - serialize_started) * 1000.0,
+                body_bytes,
+            )
+
             async with client_factory() as client:
+                put_started = perf_counter()
+                logger.info(
+                    "[emit:%s] stage=object_put status=start bytes=%d key=%s",
+                    trace_id,
+                    body_bytes,
+                    key,
+                )
                 await client.put_object(
                     Bucket=cfg.bucket,
                     Key=key,
-                    Body=dumps(payload, separators=(",", ":")),
+                    Body=body,
                     ContentType="application/json",
+                )
+                logger.info(
+                    "[emit:%s] stage=object_put status=done duration_ms=%.1f bytes=%d",
+                    trace_id,
+                    (perf_counter() - put_started) * 1000.0,
+                    body_bytes,
                 )
             await add_index_key_if_new(
                 client_factory=client_factory,
                 bucket=cfg.bucket,
                 key=key,
                 index_key=index_key,
+                trace_id=trace_id,
             )
             return key
 
-        return await _run_guarded(_upload())
+        return await _run_guarded(_upload(), label=trace_id)
     except Exception as e:
         logger.error("%sFailed to upload %s: %s", LOG_PREFIX, label, e)
         return None
@@ -164,7 +215,19 @@ async def _upload_private_response_blob(
         "miner_uid": miner.uid,
         "predictions": response_predictions,
     }
-    return await _upload_to_private_r2(key, f"{prefix}/index.json", payload, f"response blob for miner {miner.hotkey}")
+    if challenge.image_url:
+        payload["image_url"] = challenge.image_url
+    trace_id = (
+        f"private-response:{safe_element}:{miner.hotkey[:6]}:"
+        f"{challenge.challenge_id[:8]}"
+    )
+    return await _upload_to_private_r2(
+        key,
+        f"{prefix}/index.json",
+        payload,
+        f"response blob for miner {miner.hotkey}",
+        trace_id=trace_id,
+    )
 
 
 async def _upload_benchmark_result(
@@ -193,7 +256,17 @@ async def _upload_benchmark_result(
         "map_at_1s": benchmark_result.map_at_1s,
         "per_action_ap": benchmark_result.per_action_ap,
     }
-    return await _upload_to_private_r2(key, f"{prefix}/index.json", payload, f"benchmark for miner {miner.hotkey}")
+    trace_id = (
+        f"private-benchmark:{safe_element}:{miner.hotkey[:6]}:"
+        f"{challenge.challenge_id[:8]}"
+    )
+    return await _upload_to_private_r2(
+        key,
+        f"{prefix}/index.json",
+        payload,
+        f"benchmark for miner {miner.hotkey}",
+        trace_id=trace_id,
+    )
 
 
 _PUBLIC_SHARD_FIELDS = {
@@ -205,7 +278,11 @@ _PUBLIC_SHARD_FIELDS = {
 
 
 def _strip_for_public_shard(result: dict) -> dict:
-    return {k: v for k, v in result.items() if k in _PUBLIC_SHARD_FIELDS}
+    public_result = {k: v for k, v in result.items() if k in _PUBLIC_SHARD_FIELDS}
+    if result.get("groundtruth_type") == "tcg_grading":
+        public_result["element_id"] = result.get("element_id")
+        public_result["groundtruth_type"] = "tcg_grading"
+    return public_result
 
 
 async def _upload_shard(results: list[dict], block: int, hotkey_ss58: str) -> str | None:
@@ -218,26 +295,55 @@ async def _upload_shard(results: list[dict], block: int, hotkey_ss58: str) -> st
     client_factory = lambda: create_s3_client(
         cfg, error_message="Central R2 not configured for private track"
     )
+    trace_id = f"private-final-shard:{hotkey_ss58[:6]}:{block}"
 
     try:
         async def _upload():
+            serialize_started = perf_counter()
+            logger.info("[emit:%s] stage=object_serialize status=start", trace_id)
+            body = dumps(
+                [_strip_for_public_shard(r) for r in results],
+                separators=(",", ":"),
+            )
+            body_bytes = len(body.encode())
+            logger.info(
+                "[emit:%s] stage=object_serialize status=done duration_ms=%.1f bytes=%d",
+                trace_id,
+                (perf_counter() - serialize_started) * 1000.0,
+                body_bytes,
+            )
+
             async with client_factory() as client:
+                put_started = perf_counter()
+                logger.info(
+                    "[emit:%s] stage=object_put status=start bytes=%d key=%s",
+                    trace_id,
+                    body_bytes,
+                    key,
+                )
                 await client.put_object(
                     Bucket=cfg.bucket,
                     Key=key,
-                    Body=dumps([_strip_for_public_shard(r) for r in results], separators=(",", ":")),
+                    Body=body,
                     ContentType="application/json",
+                )
+                logger.info(
+                    "[emit:%s] stage=object_put status=done duration_ms=%.1f bytes=%d",
+                    trace_id,
+                    (perf_counter() - put_started) * 1000.0,
+                    body_bytes,
                 )
             await add_index_key_if_new(
                 client_factory=client_factory,
                 bucket=cfg.bucket,
                 key=key,
                 index_key=index_key,
+                trace_id=trace_id,
             )
             logger.info("Uploaded shard: %s", key)
             return key
 
-        return await _run_guarded(_upload())
+        return await _run_guarded(_upload(), label=trace_id)
     except Exception as e:
         logger.error("Failed to upload shard: %s", e)
         return None
@@ -314,16 +420,31 @@ async def _challenge_miner(
     element_id: str,
     pillar_weights: dict[str, float] | None,
     image_digest: str,
+    *,
+    attempt: ChallengeAttempt | None = None,
 ) -> tuple[dict, list[dict] | None, BenchmarkResult | None]:
     try:
-        attempt = await send_challenge(miner, challenge, keypair, timeout=timeout)
+        if attempt is None:
+            attempt = await send_challenge(miner, challenge, keypair, timeout=timeout)
         response = attempt.response
         is_scored = response is not None and not attempt.timed_out
         response_predictions = None
         benchmark_result = None
 
         if is_scored:
-            if challenge.groundtruth_type == "cricket_delivery":
+            if challenge.groundtruth_type == "tcg_grading":
+                tcg_prediction = response.prediction if response.is_tcg_grading else None
+                score, field_breakdown = score_tcg_grading_with_breakdown(
+                    tcg_prediction,
+                    challenge.ground_truth,
+                )
+                score_breakdown = {"tcg_grading": score, **field_breakdown}
+                pred_count = response.prediction_count if tcg_prediction else 0
+                response_predictions = (
+                    [tcg_prediction.model_dump(mode="json")] if tcg_prediction else []
+                )
+                benchmark_result = None
+            elif challenge.groundtruth_type == "cricket_delivery":
                 cricket_prediction = None
                 if response.prediction is not None and hasattr(response.prediction, "item"):
                     cricket_prediction = response.prediction.item
@@ -404,7 +525,7 @@ async def _challenge_miner(
             processing_time=attempt.elapsed_s,
             timestamp=datetime.now(timezone.utc).isoformat(),
             block=block,
-            video_url=challenge.video_url or "",
+            video_url=challenge.video_url or challenge.image_url or "",
             response_time_s=attempt.elapsed_s,
             timed_out=attempt.timed_out,
             image_repo=miner.image_repo,
@@ -412,6 +533,7 @@ async def _challenge_miner(
             image_digest=image_digest,
             scoring_version=PRIVATE_SCORING_VERSION,
             score_breakdown=score_breakdown,
+            groundtruth_type=challenge.groundtruth_type,
         )), response_predictions, benchmark_result
     except Exception as e:
         logger.error("Miner %s challenge processing failed: %s", miner.hotkey, e)
@@ -426,13 +548,14 @@ async def _challenge_miner(
             processing_time=0.0,
             timestamp=datetime.now(timezone.utc).isoformat(),
             block=block,
-            video_url=challenge.video_url or "",
+            video_url=challenge.video_url or challenge.image_url or "",
             timed_out=True,
             image_repo=miner.image_repo,
             image_tag=miner.image_tag,
             image_digest=image_digest,
             scoring_version=PRIVATE_SCORING_VERSION,
             score_breakdown={},
+            groundtruth_type=challenge.groundtruth_type,
         )), None, None
 
 
@@ -453,7 +576,7 @@ async def _emit_private_score_to_public_db(
     challenge_obj = SVChallenge(
         env="private-track",
         payload=TVPredictInput(
-            url=challenge.video_url,
+            url=challenge.video_url or challenge.image_url,
             frames=payload_frames,
             meta={
                 "track": "private",
@@ -513,24 +636,27 @@ async def _emit_private_score_to_public_db(
         "image_digest": result.get("image_digest"),
     }
 
-    await _run_guarded(emit_shard(
-        slug=f"private-{miner.uid}",
-        challenge=challenge_obj,
-        miner_run=miner_run,
-        evaluation=evaluation,
-        miner_hotkey_ss58=miner.hotkey,
-        trigger_block=trigger_block,
-        element_id=element_id,
-        manifest_hash=manifest_hash,
-        lane="private",
-        model=miner.image_repo,
-        revision=miner.image_tag,
-        chute_id=None,
-        commitment_meta=commitment_meta,
-        commit_block=miner.commit_block,
-        store_response_blob=False,
-        responses_key_override=private_responses_key,
-    ))
+    await _run_guarded(
+        emit_shard(
+            slug=f"private-{miner.uid}",
+            challenge=challenge_obj,
+            miner_run=miner_run,
+            evaluation=evaluation,
+            miner_hotkey_ss58=miner.hotkey,
+            trigger_block=trigger_block,
+            element_id=element_id,
+            manifest_hash=manifest_hash,
+            lane="private",
+            model=miner.image_repo,
+            revision=miner.image_tag,
+            chute_id=None,
+            commitment_meta=commitment_meta,
+            commit_block=miner.commit_block,
+            store_response_blob=False,
+            responses_key_override=private_responses_key,
+        ),
+        label=f"{element_id}:{miner.hotkey[:6]}",
+    )
 
 
 def _log_runner_task_failure(task: asyncio.Task, element_id: str, block: int) -> None:
@@ -606,8 +732,19 @@ async def _run_challenge_for_element(
             element_id,
         )
 
-        outcomes = list(await asyncio.gather(*[
-            _challenge_miner(
+        attempts = list(await asyncio.gather(*[
+            send_challenge(
+                miner,
+                challenge,
+                keypair,
+                timeout=settings.PRIVATE_MINER_TIMEOUT_S,
+            )
+            for miner in miners
+        ]))
+
+        outcomes = []
+        for miner, attempt in zip(miners, attempts):
+            outcomes.append(await _challenge_miner(
                 miner,
                 challenge,
                 keypair,
@@ -616,9 +753,8 @@ async def _run_challenge_for_element(
                 element_id,
                 pillar_weights,
                 miner.image_digest,
-            )
-            for miner in miners
-        ]))
+                attempt=attempt,
+            ))
 
         results: list[dict] = []
         for miner, (result, response_predictions, benchmark_result) in zip(miners, outcomes):
@@ -679,23 +815,28 @@ def _trigger_scheduled_runners(
     subtensor,
 ) -> None:
     for element_id, entry in element_state.items():
-        tempo = max(1, int(entry["tempo"]))
-        anchor = int(entry["anchor"])
         task = entry.get("task")
-        delta = block - anchor
-        should_trigger = (delta >= 0) and (delta % tempo == 0)
+        trigger_block = get_due_trigger_block(entry, block)
 
-        if not should_trigger:
+        if trigger_block is None:
             continue
 
         if task is not None and not task.done():
-            logger.info("%selement_id=%s still running; skipping at block=%s", LOG_PREFIX, element_id, block)
+            logger.info("%selement_id=%s still running; skipping at block=%s", LOG_PREFIX, element_id, trigger_block)
         else:
-            logger.info("%sTriggering challenge for element_id=%s at block=%s", LOG_PREFIX, element_id, block)
+            if trigger_block != block:
+                logger.warning(
+                    "%sCaught up missed trigger for element_id=%s scheduled_block=%s current_block=%s",
+                    LOG_PREFIX,
+                    element_id,
+                    trigger_block,
+                    block,
+                )
+            logger.info("%sTriggering challenge for element_id=%s at block=%s", LOG_PREFIX, element_id, trigger_block)
             task = asyncio.create_task(
-                _run_challenge_for_element(element_id, manifest, block, keypair, subtensor)
+                _run_challenge_for_element(element_id, manifest, trigger_block, keypair, subtensor)
             )
-            task.add_done_callback(lambda t, e=element_id, b=block: _log_runner_task_failure(t, e, b))
+            task.add_done_callback(lambda t, e=element_id, b=trigger_block: _log_runner_task_failure(t, e, b))
             entry["task"] = task
 
 
@@ -726,7 +867,13 @@ async def challenge_loop(path_manifest: Path | None = None) -> None:
                 try:
                     subtensor = await get_subtensor()
                 except Exception as e:
-                    logger.warning("%ssubtensor connect failed: %s → retrying in %.1fs", LOG_PREFIX, e, reconnect_delay)
+                    logger.warning(
+                        "%ssubtensor connect failed: %s: %r → retrying in %.1fs",
+                        LOG_PREFIX,
+                        type(e).__name__,
+                        e,
+                        reconnect_delay,
+                    )
                     reset_subtensor()
                     subtensor = None
                     await asyncio.sleep(reconnect_delay)
@@ -740,8 +887,14 @@ async def challenge_loop(path_manifest: Path | None = None) -> None:
                 subtensor = None
                 await asyncio.sleep(2.0)
                 continue
-            except (KeyError, ConnectionError, RuntimeError) as err:
-                logger.warning("%sget_current_block error (%s) → resetting", LOG_PREFIX, err)
+            except Exception as err:
+                logger.warning(
+                    "%sget_current_block error (%s: %r) → resetting",
+                    LOG_PREFIX,
+                    type(err).__name__,
+                    err,
+                    exc_info=True,
+                )
                 reset_subtensor()
                 subtensor = None
                 await asyncio.sleep(2.0)
@@ -750,13 +903,25 @@ async def challenge_loop(path_manifest: Path | None = None) -> None:
             try:
                 new_manifest = await load_manifest(path_manifest, settings, block)
             except Exception as e:
-                logger.error("%sFailed to load manifest at block %s: %s", LOG_PREFIX, block, e)
+                logger.error(
+                    "%sFailed to load manifest at block %s: %s: %r",
+                    LOG_PREFIX,
+                    block,
+                    type(e).__name__,
+                    e,
+                )
                 try:
                     await asyncio.wait_for(subtensor.wait_for_block(), timeout=wait_block_timeout)
                 except asyncio.TimeoutError:
                     continue
-                except (KeyError, ConnectionError, RuntimeError) as err:
-                    logger.warning("%swait_for_block error (%s); resetting", LOG_PREFIX, err)
+                except Exception as err:
+                    logger.warning(
+                        "%swait_for_block error (%s: %r); resetting",
+                        LOG_PREFIX,
+                        type(err).__name__,
+                        err,
+                        exc_info=True,
+                    )
                     reset_subtensor()
                     subtensor = None
                     await asyncio.sleep(2.0)
@@ -782,8 +947,14 @@ async def challenge_loop(path_manifest: Path | None = None) -> None:
                 await asyncio.wait_for(subtensor.wait_for_block(), timeout=wait_block_timeout)
             except asyncio.TimeoutError:
                 continue
-            except (KeyError, ConnectionError, RuntimeError) as err:
-                logger.warning("%swait_for_block error (%s); resetting", LOG_PREFIX, err)
+            except Exception as err:
+                logger.warning(
+                    "%swait_for_block error (%s: %r); resetting",
+                    LOG_PREFIX,
+                    type(err).__name__,
+                    err,
+                    exc_info=True,
+                )
                 reset_subtensor()
                 subtensor = None
                 await asyncio.sleep(2.0)
@@ -793,11 +964,16 @@ async def challenge_loop(path_manifest: Path | None = None) -> None:
             break
 
         except Exception as e:
-            logger.warning("%sError: %s; resetting subtensor and retrying...", LOG_PREFIX, e)
+            logger.exception(
+                "%sError: %s: %r; resetting subtensor and retrying...",
+                LOG_PREFIX,
+                type(e).__name__,
+                e,
+            )
             reset_subtensor()
             subtensor = None
             try:
-                await asyncio.wait_for(shutdown_event.wait(), timeout=120.0)
+                await asyncio.wait_for(shutdown_event.wait(), timeout=reconnect_delay)
             except asyncio.TimeoutError:
                 pass
 

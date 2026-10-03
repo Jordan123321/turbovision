@@ -19,7 +19,7 @@ This is not a redesign. It is the smallest rigorous path to a live snooker CV ch
 - Miner forwarding of `target_frames`
 - Runner scoring/upload support for snooker
 - Spotcheck rescoring support for snooker
-- Score-scaled private weighting for snooker, matching cricket behavior
+- Ranked 80/15/5 private weighting for snooker, matching current cricket behavior
 - Hardened ball-state scorer with target-frame-only evaluation and red Hungarian matching
 - Miner-facing spec and backend/data handoff docs
 - Full local validator/private test coverage

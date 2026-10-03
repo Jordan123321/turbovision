@@ -1,8 +1,14 @@
+import asyncio
 from scorevision.utils.cloudflare_helpers import (
+    _cache_remote_json_array,
     _extract_element_miner_commit_tuple_from_key_or_url,
+    _exception_summary,
+    _inactive_miners_key,
     _lane_index_key,
     _select_lane_specific_index_url,
+    _sink_sv_at_with_retries,
     emit_shard,
+    put_inactive_miners,
 )
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -63,6 +69,163 @@ def test_lane_index_key_public():
 
 def test_lane_index_key_private():
     assert _lane_index_key("private") == "manako/indexprivate.json"
+
+
+def test_inactive_miners_key_is_next_to_public_index():
+    assert _inactive_miners_key() == "manako/inactive_miners.json"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", ["public", "private"])
+async def test_remote_index_recovers_after_two_failures(monkeypatch, lane):
+    url = _select_lane_specific_index_url("https://example.com/manako/index.json", lane)
+    fetch = AsyncMock(side_effect=[TimeoutError(), RuntimeError("HTTP 429"), []])
+    sleep = AsyncMock()
+    monkeypatch.setattr(cloudflare_helpers, "_http_get_json", fetch)
+    monkeypatch.setattr(cloudflare_helpers.asyncio, "sleep", sleep)
+
+    assert await cloudflare_helpers._list_keys_from_remote_index(url) == []
+    assert fetch.await_count == 3
+    assert all(call.args == (url,) for call in fetch.await_args_list)
+    assert [call.args for call in sleep.await_args_list] == [(1,), (2,)]
+
+
+@pytest.mark.asyncio
+async def test_remote_index_stops_after_three_failures(monkeypatch):
+    fetch = AsyncMock(side_effect=TimeoutError())
+    sleep = AsyncMock()
+    monkeypatch.setattr(cloudflare_helpers, "_http_get_json", fetch)
+    monkeypatch.setattr(cloudflare_helpers.asyncio, "sleep", sleep)
+
+    with pytest.raises(TimeoutError):
+        await cloudflare_helpers._list_keys_from_remote_index("https://example.com/manako/index.json")
+    assert fetch.await_count == 3
+    assert sleep.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_remote_index_does_not_retry_success_or_cancellation(monkeypatch):
+    fetch = AsyncMock(return_value=["manako/shard.json"])
+    sleep = AsyncMock()
+    monkeypatch.setattr(cloudflare_helpers, "_http_get_json", fetch)
+    monkeypatch.setattr(cloudflare_helpers.asyncio, "sleep", sleep)
+    url = "https://example.com/manako/index.json"
+
+    assert await cloudflare_helpers._list_keys_from_remote_index(url) == [
+        "https://example.com/manako/shard.json"
+    ]
+    fetch.assert_awaited_once_with(url)
+    fetch.reset_mock(side_effect=True)
+    fetch.side_effect = asyncio.CancelledError()
+    with pytest.raises(asyncio.CancelledError):
+        await cloudflare_helpers._list_keys_from_remote_index(url)
+    fetch.assert_awaited_once_with(url)
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_put_inactive_miners_merges_with_existing_list(monkeypatch):
+    put_object = AsyncMock()
+    existing_body = AsyncMock()
+    existing_body.read.return_value = (
+        b'[{"hotkey":"hk-old","element_id":"element-old","commit_block":100}]'
+    )
+    get_object = AsyncMock(return_value={"Body": existing_body})
+
+    class FakeClientContext:
+        async def __aenter__(self):
+            return SimpleNamespace(get_object=get_object, put_object=put_object)
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    monkeypatch.setattr(
+        cloudflare_helpers,
+        "get_settings",
+        lambda: SimpleNamespace(SCOREVISION_BUCKET="central-bucket"),
+    )
+    monkeypatch.setattr(
+        cloudflare_helpers,
+        "get_s3_client",
+        lambda: FakeClientContext(),
+    )
+    inactive_miners = [
+        {"hotkey": "hk1", "element_id": "element-a", "commit_block": 123}
+    ]
+
+    key = await put_inactive_miners(inactive_miners)
+
+    assert key == "manako/inactive_miners.json"
+    put_object.assert_awaited_once_with(
+        Bucket="central-bucket",
+        Key="manako/inactive_miners.json",
+        Body=(
+            '[{"hotkey":"hk-old","element_id":"element-old","commit_block":100},'
+            '{"hotkey":"hk1","element_id":"element-a","commit_block":123}]'
+        ),
+        ContentType="application/json",
+    )
+
+
+def test_exception_summary_includes_type_for_empty_message():
+    assert _exception_summary(TimeoutError()) == "TimeoutError"
+
+
+@pytest.mark.asyncio
+async def test_score_shard_write_retries_twice(monkeypatch):
+    sink_mock = AsyncMock(
+        side_effect=[
+            TimeoutError("first failure"),
+            ConnectionError("second failure"),
+            ("5Fhotkey", [{"signature": "0xdeadbeef"}]),
+        ]
+    )
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(cloudflare_helpers, "sink_sv_at", sink_mock)
+    monkeypatch.setattr(cloudflare_helpers.asyncio, "sleep", sleep_mock)
+
+    result = await _sink_sv_at_with_retries(
+        "manako/element/hotkey/evaluation/000000001-challenge.json",
+        [{"payload": {"composite_score": 0.8}}],
+        lane="private",
+        timeout_s=1.0,
+        rid="element:hotkey:challenge:test",
+    )
+
+    assert result == ("5Fhotkey", [{"signature": "0xdeadbeef"}])
+    assert sink_mock.await_count == 3
+    assert [call.args[0] for call in sink_mock.await_args_list] == [
+        "manako/element/hotkey/evaluation/000000001-challenge.json"
+    ] * 3
+    assert [call.kwargs["lane"] for call in sink_mock.await_args_list] == [
+        "private"
+    ] * 3
+    assert [call.kwargs["trace_id"] for call in sink_mock.await_args_list] == [
+        "element:hotkey:challenge:test"
+    ] * 3
+    assert [call.args[0] for call in sleep_mock.await_args_list] == [0.5, 1.0]
+
+
+@pytest.mark.asyncio
+async def test_cache_remote_json_array_uses_stale_cache_when_head_fails(monkeypatch, tmp_path):
+    monkeypatch.setattr(cloudflare_helpers, "_get_cache_dir", lambda: tmp_path)
+
+    url = "https://example.com/manako/evaluation/000000001-a.json"
+    cached_path = cloudflare_helpers._cache_path_for_url(url)
+    cached_path.write_bytes(b'{"payload":{}}\n')
+
+    async def _fail_head(_url):
+        raise TimeoutError()
+
+    async def _fail_get(_url):
+        raise AssertionError("GET should not be called when stale cache is available")
+
+    monkeypatch.setattr(cloudflare_helpers, "_http_head_meta", _fail_head)
+    monkeypatch.setattr(cloudflare_helpers, "_http_get_json", _fail_get)
+
+    result = await _cache_remote_json_array(url, asyncio.Semaphore(1))
+
+    assert result == cached_path
 
 
 @pytest.mark.asyncio

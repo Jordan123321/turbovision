@@ -15,11 +15,17 @@ For cricket challenges, miners should return exactly one delivery prediction in 
   "challenge_id": "<challenge_id>",
   "prediction": {
     "kph": 126.86,
+    "release_y": -0.42,
+    "release_z": 2.01,
     "bounce_x": 8.001,
+    "bounce_y": 0.21,
+    "impact_x": 1.34,
+    "impact_y": 0.08,
+    "impact_z": 0.74,
     "stump_y": 0.017,
+    "stump_z": 1.046,
     "deviation": 1.104,
-    "swing_angle": -2.402,
-    "stump_z": 1.046
+    "swing_angle": -2.402
   },
   "processing_time": 0.73
 }
@@ -96,81 +102,78 @@ All positional measurements are in meters and use a shared coordinate system:
 
 ## What Miners Should Prioritize
 
-The validator currently supports the full canonical row, but miners should focus first on these six fields:
+The validator currently supports the full canonical row. Twelve ball-tracking fields contribute to the score, with the following priority tiers:
 
-1. `kph`
-2. `bounce_x`
-3. `stump_y`
-4. `deviation`
-5. `swing_angle`
-6. `stump_z`
+1. `bounce_x`, `kph`, `stump_y`, `stump_z`, and `impact_x` (10% each)
+2. `deviation`, `swing_angle`, `release_y`, `release_z`, and `impact_y` (8% each)
+3. `bounce_y` and `impact_z` (5% each)
 
-These are the main v1 ball-tracking asks and dominate the score.
+Together, these fields account for 100% of the score. `interception_distance`, identifiers, and outcome fields remain accepted but carry no scoring weight.
 
 ## Recommended Return Shape
 
 ### Primary / high-value fields
 
-These fields carry most of the reward signal and should be implemented first:
+These fields have the highest individual weights and should be implemented first:
 
-- `kph`
-- `bounce_x`
-- `stump_y`
-- `deviation`
-- `swing_angle`
-- `stump_z`
+- `bounce_x` (10%)
+- `kph` (10%)
+- `stump_y` (10%)
+- `stump_z` (10%)
+- `impact_x` (10%)
 
 ### Optional / lower-value metadata fields
 
-These are accepted but currently have much smaller weight:
+These are accepted for challenge correlation. The identifiers listed below have zero scoring weight:
 
-- `match`
-- `matchid`
-- `inningsid`
-- `overid`
-- `ball_in_over`
-- `ballid`
-- `xlsx_overs`
-- `scorecard_overs`
+- `match` (0%)
+- `matchid` (0%)
+- `inningsid` (0%)
+- `overid` (0%)
+- `ball_in_over` (0%)
+- `ballid` (0%)
+- `xlsx_overs` (0%)
+- `scorecard_overs` (0%)
 
-### Optional / secondary geometry fields
+### Secondary scored fields
 
-These are useful but currently lower priority than the six primary metrics:
+These fields complete the trajectory and collectively carry half of the score:
 
-- `release_y`
-- `release_z`
-- `bounce_y`
-- `impact_x`
-- `impact_y`
-- `impact_z`
-- `interception_distance`
+- `deviation` (8%)
+- `swing_angle` (8%)
+- `release_y` (8%)
+- `release_z` (8%)
+- `impact_y` (8%)
+- `bounce_y` (5%)
+- `impact_z` (5%)
 
-### Optional / low-value outcome fields
+### Optional / zero-weight fields
 
-These are accepted but should not be the main focus for miners:
+These are accepted for compatibility but have zero scoring weight:
 
-- `runs`
-- `wickets`
+- `runs` (0%)
+- `wickets` (0%)
+- `interception_distance` (0%)
 
 ## Practical Guidance
 
-- Returning only easy metadata is not enough to score well.
-- Returning the six primary ball-tracking fields is much more valuable than returning ids alone.
+- Returning identifiers or outcome fields does not increase the score.
+- Returning all twelve scored ball-tracking fields is required to maximize the score.
 - Missing fields are allowed; they simply score `0`.
 - Exact/id-like fields are scored by exact match after light normalization.
 - Numeric physical fields are scored with strict tolerance-based decay; prioritize precise ball-tracking estimates over rough approximations.
 
 ## Current Scoring Intent
 
-At the moment, roughly:
+At the moment:
 
-- primary six metrics account for most of the score
-- metadata/id fields are deliberately downweighted
-- secondary geometry helps, but less than the primary six
-- outcome fields are low weight
+- five highest-priority metrics account for 50% of the score
+- seven secondary metrics account for the remaining 50%
+- match, delivery identifier, outcome, and `interception_distance` fields have zero weight
+- over representations are retained for correlation only and have zero weight
 
 So the intended miner strategy is:
 
-1. get the six core ball-tracking outputs working
-2. improve secondary geometry
-3. fill in metadata and outcomes last
+1. get the five 10%-weight ball-tracking outputs working
+2. implement the seven secondary scored fields
+3. treat zero-weight metadata and outcomes as correlation data only

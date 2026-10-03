@@ -8,6 +8,7 @@ from scorevision.utils.schemas import (
     SnookerBallPrediction,
     SnookerBallStateFrame,
     SnookerBallStatePrediction,
+    TCGGradingPrediction,
 )
 from scorevision.utils.settings import get_settings
 
@@ -133,29 +134,29 @@ _PILLAR_SCORERS: dict[str, PillarScorer] = {
 }
 
 _CRICKET_FIELD_WEIGHTS: dict[str, float] = {
-    "match": 0.005,
-    "matchid": 0.005,
-    "inningsid": 0.02,
-    "overid": 0.02,
-    "ball_in_over": 0.02,
-    "ballid": 0.01,
-    "xlsx_overs": 0.01,
-    "scorecard_overs": 0.01,
-    "kph": 0.16,
-    "bounce_x": 0.18,
-    "stump_y": 0.14,
-    "deviation": 0.1,
+    "match": 0.0,
+    "matchid": 0.0,
+    "inningsid": 0.0,
+    "overid": 0.0,
+    "ball_in_over": 0.0,
+    "ballid": 0.0,
+    "xlsx_overs": 0.0,
+    "scorecard_overs": 0.0,
+    "kph": 0.10,
+    "bounce_x": 0.10,
+    "stump_y": 0.10,
+    "deviation": 0.08,
     "swing_angle": 0.08,
-    "stump_z": 0.08,
-    "release_y": 0.02,
-    "release_z": 0.02,
-    "bounce_y": 0.02,
-    "impact_x": 0.02,
-    "impact_y": 0.02,
-    "impact_z": 0.02,
-    "interception_distance": 0.02,
-    "runs": 0.01,
-    "wickets": 0.01,
+    "stump_z": 0.10,
+    "release_y": 0.08,
+    "release_z": 0.08,
+    "bounce_y": 0.05,
+    "impact_x": 0.10,
+    "impact_y": 0.08,
+    "impact_z": 0.05,
+    "interception_distance": 0.0,
+    "runs": 0.0,
+    "wickets": 0.0,
 }
 
 _CRICKET_FIELD_TOLERANCES: dict[str, float] = {
@@ -206,6 +207,16 @@ _SNOOKER_COMPONENT_WEIGHTS = {
     "red_count_accuracy": 0.10,
     "state_accuracy": 0.15,
     "false_positive_score": 0.05,
+}
+
+TCG_GRADE_TOLERANCE = 2.0
+
+_TCG_FIELD_WEIGHTS: dict[str, float] = {
+    "subgrade_surface": 0.25,
+    "subgrade_edges": 0.25,
+    "subgrade_corners": 0.25,
+    "subgrade_centering": 0.10,
+    "card_grade": 0.15,
 }
 
 
@@ -655,6 +666,47 @@ def score_snooker_ball_state_with_breakdown(
         aggregate["snooker_ball_state"] = _weighted_snooker_score(aggregate)
     score = aggregate.get("snooker_ball_state", 0.0)
     return max(0.0, min(1.0, score)), aggregate
+
+
+def score_tcg_grading_with_breakdown(
+    prediction: TCGGradingPrediction | None,
+    ground_truth: TCGGradingPrediction,
+) -> tuple[float, dict[str, float]]:
+    predicted_values = {
+        "subgrade_surface": (
+            prediction.Grading_Features.subgrade_surface if prediction else None
+        ),
+        "subgrade_edges": (
+            prediction.Grading_Features.subgrade_edges if prediction else None
+        ),
+        "subgrade_corners": (
+            prediction.Grading_Features.subgrade_corners if prediction else None
+        ),
+        "subgrade_centering": (
+            prediction.Grading_Features.subgrade_centering if prediction else None
+        ),
+        "card_grade": prediction.Header.card_grade if prediction else None,
+    }
+    actual_values = {
+        "subgrade_surface": ground_truth.Grading_Features.subgrade_surface,
+        "subgrade_edges": ground_truth.Grading_Features.subgrade_edges,
+        "subgrade_corners": ground_truth.Grading_Features.subgrade_corners,
+        "subgrade_centering": ground_truth.Grading_Features.subgrade_centering,
+        "card_grade": ground_truth.Header.card_grade,
+    }
+
+    weighted_score = 0.0
+    breakdown: dict[str, float] = {}
+    for field_name, weight in _TCG_FIELD_WEIGHTS.items():
+        field_score = _score_numeric_match(
+            predicted_values[field_name],
+            actual_values[field_name],
+            TCG_GRADE_TOLERANCE,
+        )
+        breakdown[field_name] = field_score
+        weighted_score += weight * field_score
+
+    return max(0.0, min(1.0, weighted_score)), breakdown
 
 
 def score_predictions_for_pillar(

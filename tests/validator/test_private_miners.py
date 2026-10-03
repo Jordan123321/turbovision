@@ -1,5 +1,8 @@
+import json
+from contextlib import asynccontextmanager
 from unittest.mock import patch
 
+import httpx
 import pytest
 
 from scorevision.utils.schemas import (
@@ -30,8 +33,12 @@ async def test_send_challenge_forwards_target_frames():
     captured: dict = {}
 
     class _FakeResponse:
-        def raise_for_status(self):
-            return None
+        status_code = 200
+        headers = {}
+        request = httpx.Request("POST", "http://127.0.0.1:8000/challenge")
+
+        async def aiter_bytes(self, chunk_size=None):
+            yield json.dumps(self.json()).encode()
 
         def json(self):
             return {
@@ -65,11 +72,13 @@ async def test_send_challenge_forwards_target_frames():
         async def __aexit__(self, *_args):
             return None
 
-        async def post(self, url, *, json, headers):
+        @asynccontextmanager
+        async def stream(self, method, url, *, json, headers):
+            captured["method"] = method
             captured["url"] = url
             captured["json"] = json
             captured["headers"] = headers
-            return _FakeResponse()
+            yield _FakeResponse()
 
     challenge = Challenge(
         challenge_id="snooker-1",
@@ -96,6 +105,8 @@ async def test_send_challenge_forwards_target_frames():
         attempt = await send_challenge(_miner(), challenge, hotkey=object(), timeout=5.0)
 
     assert attempt.response is not None
+    assert attempt.timed_out is False
+    assert captured["method"] == "POST"
     assert captured["url"] == "http://127.0.0.1:8000/challenge"
     assert captured["json"]["video_url"] == "https://example.com/snooker.mp4"
     assert captured["json"]["target_frames"] == [50, 150, 250]

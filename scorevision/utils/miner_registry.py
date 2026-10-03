@@ -8,11 +8,27 @@ from urllib.parse import urljoin, urlparse
 
 import aiohttp
 from huggingface_hub import HfApi
+from bittensor import AsyncSubtensor
 
 from scorevision.utils.bittensor_helpers import (
     get_subtensor,
     reset_subtensor,
     get_validator_indexes_from_chain,
+)
+from scorevision.utils.bittensor_commitments import get_all_revealed_commitments
+from scorevision.utils.commit_recovery import (
+    is_recovery_commit,
+    recover_commitments_from_shards,
+)
+from scorevision.utils.compliance_failures import (
+    ComplianceFailureTuple,
+    fetch_compliance_failure_tuples,
+    is_compliance_tuple_failed,
+)
+from scorevision.utils.inactive_miners import (
+    InactiveMinerTuple,
+    fetch_inactive_miner_tuples,
+    is_inactive_miner_tuple,
 )
 from scorevision.utils.settings import get_settings
 
@@ -30,6 +46,115 @@ HARDCODED_BLACKLIST_HOTKEYS: set[str] = {
     "5FZiTikQum61QyzWaaGmsiKmH1eX2jLcZ61V2E2WBg1QAAYV",
     "5C81gi3bXLbAWccH6VFY5T7BNhv9usEMdtwxHUVqeFPJ3zy9",
     "5Gj9pWjksQXkuaoVxHRaKN1pmgQYiUddrNweY3SFBWMGo2QD",
+    "5FkPaJTKgBr3rXX1YUt952ejVnwui4RZHoafBoR6txGkrSc3",
+    "5GYVPC5tTnHEtqZ4qVCHfyRFmQ1SDHHo9nwECphftrN8wbRG",
+    "5FkF684znSsYy1bjsaTDYpZDYN983Z5kavsvv6bNYyuNZQHy",
+    "5GNvBDx7qBcUUM3EwLTD2a5qVyFcjKs7Nf2zk2qxL1xPsXCw",
+    "5DvuNyrQQuDmzBMUDVNsRJSXBMxuBKAuKiJQUiTMAgTJoDoF",
+    "5HeKKwL1jyZnKUxSxLjVGxkioHCV2bCci6eEN1Qdd81APg4a",
+    "5GE4vXbuK7Q53AgSmwdPGrRrzUmjM4415K9JsbugS2JmcMgG",
+    "5F1mgNNNzFBjmGnq1i5SP6svoSxq2n9wp4WhA2DG9ttUKwD8",
+    "5DjwjwAhLGnuLYXFMtP5VuCeLiczEQmctiW1FMgBDkHKzhCf",
+    "5HddqPvyeF1E5FYZTiyaKQA85mprWfoP6d3GriXvks8vJXUG",
+    "5CVBjijH1eey2KobTcQJNBSBAFX5PtvdnqXKLZWswddvphMs",
+    "5CcLYznNrKLATjs3aV8USd58wCtD6keQYqmRTrtChBGU8T8C",
+    "5DUY4UEpn8EGewfezEKwFo4SfRn11mv6f1N2U8nw1LuMkA9q",
+    "5GiwVmxPXh35sWtGJTjE8YKpRy1dc9MvM1VPrgtPMpmmEoxz",
+    "5EjVevWZ8RD7ks8BX4YXXpJxSCasbSYitKHrQ1CqhQGp6JZu",
+    "5Ec6P4FZZqDHGfrD2iqa3kFAR83rqsPJRHSJtkmrcdwjBYkZ",
+    "5DhGGmDn7RrEjexDjSsRT5qWUMurt74esHqWKNyk8sYsaHQb",
+    "5CPKYUx11qM4CLJPu6UDMutEvB7VT4QA1BxhoEh5t27DvEBQ",
+    "5C4w41JTTSC3W7UPWmeppKDGTJNqAu2k7Nx7z12AZEGBXBrq",
+    "5CArLgrxQ4GLPuMzb9Y7gYCfvuGotL69b7iTvXVKdv649kM9",
+    "5CG2b2zJdd2sivzb3AEfDyVoEK4aJBtSbuw94ZaLRkMaoY9b",
+    "5CJQPab55wqeCttjiDkwg16b5GR7voxADPu3VHPhVNWV8xEe",
+    "5CJUrDvci5uSJTrN18T7r2YTavkV3FrzmsGsvnaUsrWRJcsT",
+    "5CJs8X2cHSRXSdUKYrCrCcevK5LkmNfiEb55XEgkZNcnFtAD",
+    "5CSZqok1zmt2VBpAqgsFrByLoysbzViF4JJir4jSiHaB3qbz",
+    "5CUyvfyBFJoKJwvAMhnYWet8LvNdcG6K1VsgVrMQevRKfHUw",
+    "5CZhET3dLGyLohLTQsjpMNSVssQ1g88xBoDAEMc9LMukpRDH",
+    "5CiVzdvZCyj2PEit6e7RSnhMVXY5xu3tWX5hNQhgRUbQ1A3L",
+    "5CkzEqsuUVVNW9KaruNgDSwohu2Z3j1HGmoDARGqCJCN5bDS",
+    "5CoXyequMzZrEkkA6MwfMTuxVNXWUr14NGujoa3cdg3EdRub",
+    "5CqkPf821oWrUNTiEjhhWLxnUBXiRf9Jr35bmrWDfB6nqSo3",
+    "5D7nuaXR8Lrctp11GYYMEqckXEKLXLhqxuaEh7vzi6XJGn4D",
+    "5DcbFpyCwLyXm3Xfu5izpp96DxtJefMjQRV5AyRYtDeLffv6",
+    "5DeuvQnD3fFiFpXqEYLc3PgbvLBQKtnqRURpvik8usVS6yup",
+    "5Dh9t36JU9oHSDyJ44XQP7xsDXGeChVZwLHqXUZdtTNagy8B",
+    "5Do6BUVP3WjXe1PKESKXaCQa6afbt1At8gpgJ2THZVZeYxCX",
+    "5DoHgTu9SzA6UzXMHnikoiYfXqGBBzTZofwvKgs34GPW5Q5q",
+    "5E1jXkTmZw3nXfPEJYFuR9yLfkAeB6iLN7Jpy7pTpoWqkeVG",
+    "5E1mJeKatTvGwACF8fy4VaxcjzCSFw3HxSyXYCYaWE7cSDFs",
+    "5E51HuZ8a4eU2VYQfZdeMJWDULo55uxfm9UQ87JxTMsUXk1b",
+    "5E7ND4HnnMYcYHJCfBgrvtQ1P9HaKMGekAWpXvozgK9o4vQX",
+    "5E7vhYAhLgK1HiEJJF161eQHZDxUyu41Rs4uV2vXD678Xj9A",
+    "5EADUbTATkEAR5fUcgjXadU9ogmfMMgneTbMNtqgde6i8qDB",
+    "5EFAp9FRCYf3yweHT2XURVxP4A12nkhmoQpAXmSYz7dw5XhH",
+    "5EKumErdDteNgd8d1tmTYLvAFD7thmXSzLvZTcnR58L1JDqE",
+    "5EM1F7mEnqXNpd29NWaGKjcJcBNXrw2V21zW5wHNiZTUGkUJ",
+    "5ENxR9bSU6SUtrzoaYJTw2TuBYuae4J2g4FLGE5mrn3SHbti",
+    "5EPidbuDHyHZ8VYp78toNrsfUDjnz6W5s6XPgNK42Uh9Y9ta",
+    "5EgrCbU1QDDsJndnXW6h3AdxfQX1TZ32j5ZruA5UN2vr4FbR",
+    "5EpucAdQFp69BsUYfBfVtEuwiqTU7XawirpqUDZkKjMYAdUU",
+    "5Eq9YMcRPjkM3WXXY5ndGKcsfsFfhdgN1cmKDRtRiw2EU9XN",
+    "5EyABxgVHqJfuHPJgtdVCfR59ar9VBcmkKihw9aCKkim84w5",
+    "5F445iMiCMXUjdKRP1VtEPN59n1fAScYmFgULLquHYXq2z3Q",
+    "5F6rXye5FgReC1HpLGmEVcrDHxVLnKPahce93884zday93nw",
+    "5FEeLFMj2J6NpPxNoTC7JauPgF62WwM1ZKGxKk3Ku5NWw1oE",
+    "5FLoBSkmzy7Ab8m1RXUk3XnZBVGNm513XaX89TthD9yMHKmg",
+    "5FWASJ39z6x77RAHeDNWBd8cdY9zBmAVeXrkVDUxadhkb3Hy",
+    "5FWXv1FruZZMyvBNN5QS76aLeJyHbuVaAYGhf8QCZbiotSo4",
+    "5Fe2qtT9rfXobCTMQdQHQRRtXiHf3eurDXcHgzW1SgZNKCGe",
+    "5FeNceWkA6i3NZcPMiosoMm8Xg8JQV2kd8C6qqWsTo4EVX4x",
+    "5FxgJ7PgLKpSm5sKDZv9GCw98txhcJF6FXoBuz83KP62xQVZ",
+    "5G1e9VQ6LejttBRQrZbdiwMw7WamXoSLAMLVnYmS3KvGPrS9",
+    "5G4GaDSzeUTjNmWVgUozJZemz6LwhJZgMro857ZZbG3H1Kc8",
+    "5GHaqTTSkxswM2qierqWktdsQWU6neYVn1es2ikPSXLtCaqt",
+    "5GNxJ6m12jE6B5EiLYn69Gm9bSniKSJcDHasFMccjpBPPY93",
+    "5GTf2GH5fBUacCbhMDXEYcqcYhcKcpxwTY71zVAXVFoty9ta",
+    "5GUFy8ExgLdxc19iujsZ77AMD4EnBc6SKEQxqdpHgG1Vyp9h",
+    "5GW4y7frkK1xWtEVVHbfSVqX7Kn7BFLkAyE8v3Yrx4t9gWyP",
+    "5GbZHx8x1MXfUfYkqFpHESxWvA7ntER8XzxprDW7ZU2Nfmse",
+    "5GcE2NMgHc48gGpR4UQiqDyXuNKLaVeMBrVrfuZovwu8JbLQ",
+    "5GgyWAHE75Jihopn5CoVJN2Atx8ziE4azHjNg7Pg2vukZPXj",
+    "5GhKqFVfu5WtSWGNQM9vShBHQaGGVLsMSo1FUhJgVDCwJNWJ",
+    "5GhUm2HABYgSC3PUyBuKexQ47cT3RBnSsgq7ZVPfRV5H6qNy",
+    "5GjbnhyzsVqqEoTyrGDeeFMDYMQKmEFi4SiMx4BjpBvUdiJp",
+    "5GnMCUJEgu7gjkSGeXh1SjAnfT3hQ8TyC41jDa4KXAij9L7v",
+    "5GvTPBc4STfxQXKEfzHZ9Red5rQeGHPe4uRK7HwsYeoseTRJ",
+    "5Gxhdw5P7pLsBh3ENS4Dhbq9GT7PjxCDBUfZoqgrf7wPxRfH",
+    "5H1m3gqCizC9CQs9YJm7SzQn6annTPFpcVt2BHHUohS7muJe",
+    "5HEq9QZi76QLBWEsoeLaWcR68SBHqRenDMX7drhxCMGqmkqd",
+    "5HGkB6iXTzBRXhmu26dTbjbTvuw2yHQoKSn15xk5PLMYj2kg",
+    "5HGnVLcmPKxAgVq86GRDyKXV4GJnENdiS1auELW8XnP54FcG",
+    "5HNLwiZCrqMBT5pTfUz1DtSzVYWeKkQgGuuQzBVLtf27g2wW",
+    "5HR5Rc32M7aN3bLRbwetwYkL1R8CXfS7vneHxAbBtC98cEwF",
+    "5Hb3gdQBngfuyXj628VECqri2X8XZSdErSFae2bjUB3JYm14",
+    "5Hm9t1qUqQY968Avw4K8W9KgZbrJptBNpybEdhvVw9pKE3Bz",
+    "5C5GPfX1KjgR1YDPBCADcnR28UQy25CJw1tkcQVVvJ7ZPSzr",
+    "5CSkm9JvkqQnTCzUNsEmqWJUiikG5eb9WkztUjcv7LG2rwoh",
+    "5CY5auTcUPvymijZxHReVqNKmHs5qFt3X5MwVy1fweywV4Ay",
+    "5CfFWzKM1AT47SVjRxLa7ksqdjkdCg3bsoBo221zk2WFmBiT",
+    "5CqhdKhL1gDdxYBt3VUCDRJydNKucuuxZ1EHhEBfHo7GQKYh",
+    "5Ct54MJJegsTgK1HbqUpZoAjvpDcoguofvtWUVAkKQeZCdL1",
+    "5CtqLnDkVwVXYKh57Mmak9JqYcdnFaD23FkkFLnAT7hv6Uzb",
+    "5D78MNmvXAgangdayZu3DJtRgJgdN7waddsqWZYf1byzab8R",
+    "5DEykXVkAj8s5ZuX5iiBJa6X1ouQ87dAJRSd6zxcsEDz4BrA",
+    "5DkJ8h2ns7EuU9KWMy93VT4JvpraeChQ1GPHWrEvYVfVFoZH",
+    "5DyGLMtKtroriNA1a6WYKxrhrvKUMY3SbiGBNUtpFQ6U5RER",
+    "5E1Waen8TXTK9a57xmijZD1utoTFMLfPNnbfFkvhEYX29QoX",
+    "5Ec6UgVEBeMiZikciL7VogZXKBY2NJCMNZ1qY2wrLBnvvwFh",
+    "5Ecqhez1dVWUW2i17Wtjdf4X3Bp71etwFXQHPrekCb7D5kpq",
+    "5EpvXL4pMGBtQvZYhiYqqDzJzpQDoQazaQ85vEQFLaYL33FQ",
+    "5F4kovuFSj68khx3UvGqHBu4wdH67Ua7MeeCasTeMcrNd55K",
+    "5FCxLn1oe8rpyovaDMJaDAFnegZ9xf7GHATwfBZiuSZGm8RW",
+    "5G1X1vih425XthcEPWY4HivRrWjvfm3nV4RByL1NGwCeuNxD",
+    "5GZNy3CmgA5aCuZi361vvJBo2UskDtC8KxWr4WvgReq1DL47",
+    "5Gbmes6C8SzSEnN1wuWkwdc7FVFcuaYsyhmH9F1KTXsqnzmr",
+    "5GjUo4VKrjoB8AniH6Yb8gTYrLEiVCK4AfRaKVm8MLL5bdtC",
+    "5Gmrj9E1xpCRr4LyKBEfRu8Av4z6tYoVnrSMUYrtfD6ZZRgv",
+    "5HSsgBxtCZnXxh4gAbbW1dnZHppaJQz5aLMMnhjKardYfEKC",
+    "5HmMQq7C1mbF4RBZnyR8ApkYxPzv9N3DmCMMnLhWurnrgfg8",
 }
 
 REGISTRY_BYPASS_UIDS = {6}
@@ -54,6 +179,7 @@ class Miner:
     block: int
     element_id: Optional[str] = None
     registry_skip_reason: Optional[str] = None
+    registry_skip_details: Optional[dict] = None
 
 
 # ------------------------- HF gating & revision checks ------------------------- #
@@ -270,38 +396,125 @@ def _hf_repo_has_only_onnx_models(
 
 
 # ------------------------------ Chutes helpers -------------------------------- #
-async def _chutes_get_json(url: str, headers: Dict[str, str]) -> Optional[dict]:
+class _ChutesInfo(dict):
+    """Chutes metadata with non-sensitive diagnostics for the registry shard."""
+
+    def __init__(self, data: Optional[dict], *, lookup_details: dict):
+        super().__init__(data or {})
+        self.lookup_details = lookup_details
+
+
+async def _chutes_get_json(
+    url: str, headers: Dict[str, str]
+) -> tuple[Optional[dict], dict]:
     timeout = aiohttp.ClientTimeout(total=15)
+    started_at = time.monotonic()
     try:
         async with aiohttp.ClientSession(timeout=timeout) as s:
             async with s.get(url, headers=headers) as r:
                 if r.status != 200:
                     logger.debug("[Chutes] GET %s -> %s", url, r.status)
-                    return None
+                    return None, {
+                        "category": f"http_{r.status}",
+                        "http_status": r.status,
+                        "latency_ms": round((time.monotonic() - started_at) * 1000, 1),
+                    }
                 try:
                     data = await r.json()
+                    if not isinstance(data, dict):
+                        logger.debug(
+                            "[Chutes] GET %s returned unexpected JSON type %s",
+                            url,
+                            type(data).__name__,
+                        )
+                        return None, {
+                            "category": "invalid_payload_type",
+                            "payload_type": type(data).__name__,
+                            "latency_ms": round(
+                                (time.monotonic() - started_at) * 1000, 1
+                            ),
+                        }
+                    if not data:
+                        logger.debug(
+                            "[Chutes] GET %s returned an empty JSON object", url
+                        )
+                        return None, {
+                            "category": "empty_response",
+                            "latency_ms": round(
+                                (time.monotonic() - started_at) * 1000, 1
+                            ),
+                        }
                     logger.debug("[Chutes] GET %s -> ok", url)
-                    return data
+                    return data, {
+                        "category": "success",
+                        "http_status": r.status,
+                        "latency_ms": round((time.monotonic() - started_at) * 1000, 1),
+                    }
                 except Exception as e:
-                    logger.debug("[Chutes] JSON decode error for %s: %s", url, e)
-                    return None
+                    logger.debug(
+                        "[Chutes] JSON decode error for %s: %s: %r",
+                        url,
+                        type(e).__name__,
+                        e,
+                    )
+                    return None, {
+                        "category": "invalid_json",
+                        "error_type": type(e).__name__,
+                        "latency_ms": round((time.monotonic() - started_at) * 1000, 1),
+                    }
     except Exception as e:
-        logger.info("[Chutes] GET %s failed: %s", url, e)
-        return None
+        logger.info("[Chutes] GET %s failed: %s: %r", url, type(e).__name__, e)
+        if isinstance(e, (asyncio.TimeoutError, aiohttp.ServerTimeoutError)):
+            category = "timeout"
+        elif isinstance(e, aiohttp.ClientConnectionError):
+            category = "network_error"
+        elif isinstance(e, aiohttp.ClientError):
+            category = "client_error"
+        else:
+            category = "unexpected_error"
+        return None, {
+            "category": category,
+            "error_type": type(e).__name__,
+            "latency_ms": round((time.monotonic() - started_at) * 1000, 1),
+        }
 
 
 async def fetch_chute_info(chute_id: str) -> Optional[dict]:
+    started_at = time.monotonic()
     token = os.getenv("CHUTES_API_KEY", "")
     if not token or not chute_id:
         logger.debug("[Chutes] missing token or chute_id")
-        return None
+        category = "missing_api_key" if not token else "missing_chute_id"
+        return _ChutesInfo(
+            None,
+            lookup_details={
+                "category": category,
+                "attempt_count": 0,
+                "attempts": [],
+                "total_latency_ms": round(
+                    (time.monotonic() - started_at) * 1000, 1
+                ),
+            },
+        )
     url = f"https://api.chutes.ai/chutes/{chute_id}"
     headers = {"Authorization": token}
+    attempts: list[dict] = []
 
     for attempt in range(1, _CHUTES_FETCH_RETRIES + 1):
-        data = await _chutes_get_json(url, headers=headers)
+        data, attempt_details = await _chutes_get_json(url, headers=headers)
+        attempts.append({"attempt": attempt, **attempt_details})
         if data:
-            return data
+            return _ChutesInfo(
+                data,
+                lookup_details={
+                    "category": "success",
+                    "attempt_count": len(attempts),
+                    "attempts": attempts,
+                    "total_latency_ms": round(
+                        (time.monotonic() - started_at) * 1000, 1
+                    ),
+                },
+            )
         if attempt < _CHUTES_FETCH_RETRIES:
             delay_s = _CHUTES_FETCH_BACKOFF_S * (2 ** (attempt - 1))
             logger.info(
@@ -312,9 +525,22 @@ async def fetch_chute_info(chute_id: str) -> Optional[dict]:
                 delay_s,
             )
             await asyncio.sleep(delay_s)
-    return None
+    return _ChutesInfo(
+        None,
+        lookup_details={
+            "category": attempts[-1]["category"] if attempts else "unknown_error",
+            "attempt_count": len(attempts),
+            "attempts": attempts,
+            "total_latency_ms": round((time.monotonic() - started_at) * 1000, 1),
+        },
+    )
 
-def _pick_latest_miner_commit_for_element(arr, wanted_element_id: str | None):
+def _pick_latest_miner_commit_for_element(
+    arr,
+    wanted_element_id: str | None,
+    *,
+    include_recovery: bool = True,
+):
     best_blk = None
     best_data = None
     best_obj = None
@@ -331,7 +557,11 @@ def _pick_latest_miner_commit_for_element(arr, wanted_element_id: str | None):
             continue
 
         role = obj.get("role")
-        if role != "miner":
+        if role != "miner" and not (
+            include_recovery
+            and wanted_element_id is not None
+            and is_recovery_commit(obj, wanted_element_id)
+        ):
             continue
 
         committed_eid = obj.get("element_id")
@@ -393,7 +623,11 @@ async def _find_miner_commit_via_archive_backfill(
         if not hist:
             return None, None
 
-        blk, _data, obj = _pick_latest_miner_commit_for_element(hist, wanted_element_id)
+        blk, _data, obj = _pick_latest_miner_commit_for_element(
+            hist,
+            wanted_element_id,
+            include_recovery=False,
+        )
         if obj is not None:
             return int(blk or 0), obj
 
@@ -523,11 +757,13 @@ async def get_miners_from_registry(
     max_model_size_mb: float | None = None,
     onnx_only: bool | None = None,
     blacklisted_hotkeys: set[str] | None = None,
+    compliance_failure_tuples: set[ComplianceFailureTuple] | None = None,
+    inactive_miner_tuples: set[InactiveMinerTuple] | None = None,
 ) -> tuple[Dict[int, Miner], Dict[int, Miner]]:
     """
     Reads on-chain commitments, verifies HF gating/revision, optional HF repo size
-    cap, optional ONNX-only model artifact policy, and Chutes slug; then returns at most one miner per model
-    (earliest block wins).
+    cap, optional ONNX-only model artifact policy, and Chutes slug; then returns
+    at most one miner per model revision (earliest block wins).
     """
     settings = get_settings()
     mechid = settings.SCOREVISION_MECHID
@@ -536,6 +772,17 @@ async def get_miners_from_registry(
         blacklisted_hotkeys = set()
     if blacklisted_hotkeys:
         logger.info("[Registry] loaded %d blacklisted hotkeys", len(blacklisted_hotkeys))
+    if compliance_failure_tuples is None and element_id is not None:
+        compliance_failure_tuples = await fetch_compliance_failure_tuples()
+    if compliance_failure_tuples:
+        logger.info(
+            "[Registry] loaded %d compliance failing tuple(s)",
+            len(compliance_failure_tuples),
+        )
+    if inactive_miner_tuples is None and element_id is not None:
+        inactive_miner_tuples = await fetch_inactive_miner_tuples()
+    if inactive_miner_tuples:
+        logger.info("[Registry] loaded %d inactive miner tuple(s)", len(inactive_miner_tuples))
 
     try:
         st = await get_subtensor()
@@ -558,7 +805,7 @@ async def get_miners_from_registry(
 
     try:
         meta = await st.metagraph(netuid, mechid=mechid)
-        commits = await st.get_all_revealed_commitments(netuid)
+        commits = await get_all_revealed_commitments(st, netuid)
     except Exception as e:
         logger.warning("[Registry] error while fetching metagraph/commitments: %s", e)
         reset_subtensor()
@@ -566,6 +813,7 @@ async def get_miners_from_registry(
 
     # 1) Extract candidates (uid -> Miner)
     candidates: Dict[int, Miner] = {}
+    skipped: Dict[int, Miner] = {}
     wanted = str(element_id).strip() if element_id is not None else None
     resolved_first_block = (
         int(first_block)
@@ -573,6 +821,7 @@ async def get_miners_from_registry(
         else _REGISTRY_COMMIT_BACKFILL_FIRST_BLOCK
     )
     unresolved_for_backfill: list[tuple[int, str, list]] = []
+    unresolved_for_recovery: list[tuple[int, str, int]] = []
     for uid, hk in enumerate(meta.hotkeys):
         bypass_registry_checks = is_registry_bypass(uid, hk)
         if hk in blacklisted_hotkeys and not bypass_registry_checks:
@@ -590,9 +839,109 @@ async def get_miners_from_registry(
         if obj is None:
             continue
 
+        if is_recovery_commit(obj, wanted, hotkey=hk):
+            if wanted is not None:
+                unresolved_for_recovery.append((uid, hk, int(best_blk or 0)))
+            continue
+
         cand = _build_miner_candidate(uid, hk, obj, int(best_blk or 0))
         if cand is not None:
+            if is_inactive_miner_tuple(
+                inactive_miner_tuples,
+                hotkey=cand.hotkey,
+                element_id=cand.element_id,
+                commit_block=cand.block,
+            ):
+                logger.info(
+                    "[Registry] uid=%s hotkey=%s element_id=%s "
+                    "commit_block=%s ignored: inactive miner tuple",
+                    uid,
+                    cand.hotkey,
+                    cand.element_id,
+                    cand.block,
+                )
+                continue
+            if is_compliance_tuple_failed(
+                compliance_failure_tuples,
+                hotkey=cand.hotkey,
+                element_id=cand.element_id,
+                commit_block=cand.block,
+            ):
+                cand.registry_skip_reason = "compliance_failed_tuple"
+                skipped[uid] = cand
+                logger.info(
+                    "[Registry] uid=%s hotkey=%s element_id=%s commit_block=%s skipped: compliance failed tuple",
+                    uid,
+                    cand.hotkey,
+                    cand.element_id,
+                    cand.block,
+                )
+                continue
             candidates[uid] = cand
+
+    if wanted is not None and unresolved_for_recovery:
+        try:
+            validator_indexes = await get_validator_indexes_from_chain(netuid)
+            recovered = await recover_commitments_from_shards(
+                {(hk, wanted) for _uid, hk, _recovery_block in unresolved_for_recovery},
+                validator_indexes,
+            )
+            for uid, hk, recovery_block in unresolved_for_recovery:
+                recovered_commitment = recovered.get((hk, wanted))
+                if recovered_commitment is None:
+                    logger.warning(
+                        "[Registry] recovery unresolved uid=%s hotkey=%s element_id=%s "
+                        "recovery_block=%s: no valid matching public shard",
+                        uid,
+                        hk,
+                        wanted,
+                        recovery_block,
+                    )
+                    continue
+                cand = _build_miner_candidate(
+                    uid,
+                    hk,
+                    recovered_commitment.as_miner_commitment(hk),
+                    recovered_commitment.commit_block,
+                )
+                if cand is None:
+                    continue
+                if is_inactive_miner_tuple(
+                    inactive_miner_tuples,
+                    hotkey=cand.hotkey,
+                    element_id=cand.element_id,
+                    commit_block=cand.block,
+                ):
+                    logger.info(
+                        "[Registry] recovered uid=%s hotkey=%s element_id=%s "
+                        "commit_block=%s ignored: inactive miner tuple",
+                        uid,
+                        cand.hotkey,
+                        cand.element_id,
+                        cand.block,
+                    )
+                    continue
+                if is_compliance_tuple_failed(
+                    compliance_failure_tuples,
+                    hotkey=cand.hotkey,
+                    element_id=cand.element_id,
+                    commit_block=cand.block,
+                ):
+                    cand.registry_skip_reason = "compliance_failed_tuple"
+                    skipped[uid] = cand
+                    continue
+                candidates[uid] = cand
+                logger.info(
+                    "[Registry] recovered uid=%s hotkey=%s element_id=%s "
+                    "original_commit_block=%s from shard_block=%s",
+                    uid,
+                    hk,
+                    wanted,
+                    cand.block,
+                    recovered_commitment.shard_block,
+                )
+        except Exception as e:
+            logger.warning("[Registry] commitment recovery disabled due to error: %s", e)
 
     if (
         wanted is not None
@@ -628,9 +977,9 @@ async def get_miners_from_registry(
             )
             st_archive = None
             try:
-                from bittensor import async_subtensor
-
-                st_archive = async_subtensor(_REGISTRY_COMMIT_BACKFILL_ARCHIVE_ENDPOINT)
+                st_archive = AsyncSubtensor(
+                    network=_REGISTRY_COMMIT_BACKFILL_ARCHIVE_ENDPOINT
+                )
                 await asyncio.wait_for(st_archive.initialize(), timeout=20.0)
                 sem = asyncio.Semaphore(_REGISTRY_COMMIT_BACKFILL_CONCURRENCY)
 
@@ -664,6 +1013,37 @@ async def get_miners_from_registry(
 
                     cand = _build_miner_candidate(uid_i, hk_i, obj_i, int(blk_i))
                     if cand is not None:
+                        if is_inactive_miner_tuple(
+                            inactive_miner_tuples,
+                            hotkey=cand.hotkey,
+                            element_id=cand.element_id,
+                            commit_block=cand.block,
+                        ):
+                            logger.info(
+                                "[Registry] uid=%s hotkey=%s element_id=%s "
+                                "commit_block=%s ignored: inactive miner tuple",
+                                uid_i,
+                                cand.hotkey,
+                                cand.element_id,
+                                cand.block,
+                            )
+                            continue
+                        if is_compliance_tuple_failed(
+                            compliance_failure_tuples,
+                            hotkey=cand.hotkey,
+                            element_id=cand.element_id,
+                            commit_block=cand.block,
+                        ):
+                            cand.registry_skip_reason = "compliance_failed_tuple"
+                            skipped[uid_i] = cand
+                            logger.info(
+                                "[Registry] uid=%s hotkey=%s element_id=%s commit_block=%s skipped: compliance failed tuple",
+                                uid_i,
+                                cand.hotkey,
+                                cand.element_id,
+                                cand.block,
+                            )
+                            continue
                         candidates[uid_i] = cand
                         added += 1
                 logger.info("[Registry] archive backfill added %d candidate(s)", added)
@@ -679,15 +1059,17 @@ async def get_miners_from_registry(
     logger.info("[Registry] %d on-chain candidates", len(candidates))
     if not candidates:
         logger.warning("[Registry] No on-chain candidates")
-        return {}, {}
+        return {}, skipped
 
-    def _mark_skipped(uid: int, miner: Miner, reason: str) -> None:
+    def _mark_skipped(
+        uid: int, miner: Miner, reason: str, details: Optional[dict] = None
+    ) -> None:
         miner.registry_skip_reason = reason
+        miner.registry_skip_details = details
         skipped[uid] = miner
 
     # 2) Filter by HF gating/inaccessible + Chutes slug/revision checks
     filtered: Dict[int, Miner] = {}
-    skipped: Dict[int, Miner] = {}
     for uid, m in candidates.items():
         if is_registry_bypass(uid, m.hotkey):
             logger.info("[Registry] uid=%s hotkey=%s bypassed registry filters", uid, m.hotkey)
@@ -753,14 +1135,32 @@ async def get_miners_from_registry(
 
         ok = True
         chute_reason = None
+        chute_lookup_details = None
         if m.chute_id:
             try:
                 info = await fetch_chute_info(m.chute_id)
+                chute_lookup_details = getattr(info, "lookup_details", None)
             except Exception as e:
                 logger.info("[Registry] uid=%s slug=%s: Chutes lookup error: %s", uid, m.slug, e)
                 info = None
+                chute_lookup_details = {
+                    "category": "unexpected_error",
+                    "attempt_count": 0,
+                    "attempts": [],
+                    "error_type": type(e).__name__,
+                }
             if not info:
-                logger.info("[Registry] uid=%s slug=%s: Chutes unfetched", uid, m.slug)
+                lookup_category = (
+                    chute_lookup_details.get("category")
+                    if isinstance(chute_lookup_details, dict)
+                    else "unknown_error"
+                )
+                logger.info(
+                    "[Registry] uid=%s slug=%s: Chutes unfetched (%s)",
+                    uid,
+                    m.slug,
+                    lookup_category,
+                )
                 ok = False
                 chute_reason = "chutes_unfetched"
             else:
@@ -788,43 +1188,52 @@ async def get_miners_from_registry(
         if ok:
             filtered[uid] = m
         else:
-            _mark_skipped(uid, m, chute_reason or "chutes_validation_failed")
+            details = None
+            if chute_lookup_details is not None:
+                details = {"chutes_lookup": chute_lookup_details}
+            _mark_skipped(
+                uid,
+                m,
+                chute_reason or "chutes_validation_failed",
+                details,
+            )
 
     logger.info("[Registry] %d miners after filtering", len(filtered))
     if not filtered:
         logger.warning("[Registry] Filter produced no eligible miners")
         return {}, skipped
 
-    # 3) De-duplicate by model: keep earliest block per model (stable)
-    best_by_model: Dict[str, Tuple[int, int]] = {}
+    # 3) De-duplicate by model revision: keep earliest block per pair (stable)
+    best_by_model_revision: Dict[Tuple[str, str], Tuple[int, int]] = {}
     for uid, m in filtered.items():
-        dedup_key = m.model
-        if not dedup_key and is_registry_bypass(uid, m.hotkey):
-            dedup_key = f"__bypass_uid_{uid}"
-        if not dedup_key:
+        if not m.model and is_registry_bypass(uid, m.hotkey):
+            dedup_key = (f"__bypass_uid_{uid}", "")
+        elif m.model:
+            dedup_key = (m.model, m.revision or "")
+        else:
             continue
         blk = m.block if isinstance(m.block, int) else (int(m.block) if m.block is not None else (2**63 - 1))
-        prev = best_by_model.get(dedup_key)
+        prev = best_by_model_revision.get(dedup_key)
         if prev is None or blk < prev[0]:
-            best_by_model[dedup_key] = (blk, uid)
+            best_by_model_revision[dedup_key] = (blk, uid)
 
-    keep_uids = {uid for _, uid in best_by_model.values()}
+    keep_uids = {uid for _, uid in best_by_model_revision.values()}
     kept = {uid: filtered[uid] for uid in keep_uids if uid in filtered}
     dedup_skipped = {}
     for uid, miner in filtered.items():
         if uid in keep_uids:
             continue
-        winner = best_by_model.get(miner.model or "")
+        winner = best_by_model_revision.get((miner.model or "", miner.revision or ""))
         if winner is not None:
             winner_blk, winner_uid = winner
             miner.registry_skip_reason = (
-                f"dedup_by_model_kept_uid:{winner_uid}_block:{winner_blk}"
+                f"dedup_by_model_revision_kept_uid:{winner_uid}_block:{winner_blk}"
             )
         else:
-            miner.registry_skip_reason = "dedup_by_model"
+            miner.registry_skip_reason = "dedup_by_model_revision"
         dedup_skipped[uid] = miner
     skipped.update(dedup_skipped)
-    logger.info("[Registry] %d miners kept after de-dup by model", len(kept))
+    logger.info("[Registry] %d miners kept after de-dup by model revision", len(kept))
     logger.info("[Registry] %d miners skipped", len(skipped))
 
     return kept, skipped

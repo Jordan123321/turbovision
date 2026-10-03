@@ -1,3 +1,4 @@
+from logging import getLogger
 from os import getenv
 from functools import lru_cache
 from pathlib import Path
@@ -5,6 +6,32 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, SecretStr
 
 __version__ = "0.2.0"
+
+logger = getLogger(__name__)
+
+DEFAULT_FAILING_TUPLES_URL = "https://turbo.scoredata.me/manako/conformity/failing_tuples.json"
+# The latency machine no longer writes this file, and anyone holding the conformity
+# key still can. Honouring a stale override would leave a validator reading an
+# attacker-writable ban list, so the value is refused rather than used.
+LEGACY_FAILING_TUPLES_URLS = (
+    "https://conformity.scoredata.me/compliance/failing_tuples.json",
+)
+
+
+def _failing_tuples_url() -> str:
+    configured = (getenv("SCOREVISION_FAILING_TUPLES_URL", "") or "").strip()
+    if not configured:
+        return DEFAULT_FAILING_TUPLES_URL
+    if configured.rstrip("/") in LEGACY_FAILING_TUPLES_URLS:
+        logger.warning(
+            "[settings] SCOREVISION_FAILING_TUPLES_URL points at the retired conformity "
+            "list (%s), which is no longer written and is writable by whoever holds the "
+            "conformity key; using %s instead",
+            configured,
+            DEFAULT_FAILING_TUPLES_URL,
+        )
+        return DEFAULT_FAILING_TUPLES_URL
+    return configured
 
 
 class Settings(BaseModel):
@@ -25,6 +52,7 @@ class Settings(BaseModel):
     CHUTES_MINER_PREDICT_ENDPOINT: str
     CHUTES_MINER_BASE_URL_TEMPLATE: str
     CHUTES_API_KEY: SecretStr
+    CHUTES_HF_TOKEN: SecretStr
     PATH_CHUTE_TEMPLATES: Path
     PATH_CHUTE_SCRIPT: Path
     FILENAME_CHUTE_MAIN: str
@@ -110,6 +138,7 @@ class Settings(BaseModel):
     SCOREVISION_CENTRAL_VALIDATOR_HOTKEY: str
     SCOREVISION_PUBLIC_MIN_CHALLENGES: int
     SCOREVISION_PUBLIC_EVAL_WINDOW_DAYS: float
+    SCOREVISION_FAILING_TUPLES_URL: str
 
     # Runner
     RUNNER_GET_BLOCK_TIMEOUT_S: float
@@ -144,7 +173,13 @@ class Settings(BaseModel):
     PRIVATE_RESPONSES_R2_ACCOUNT_ID: SecretStr
     PRIVATE_RESPONSES_R2_WRITE_ACCESS_KEY_ID: SecretStr
     PRIVATE_RESPONSES_R2_WRITE_SECRET_ACCESS_KEY: SecretStr
+    PRIVATE_RESPONSES_R2_READ_ACCESS_KEY_ID: SecretStr
+    PRIVATE_RESPONSES_R2_READ_SECRET_ACCESS_KEY: SecretStr
     PRIVATE_RESPONSES_R2_PREFIX: str
+    PRIVATE_AUDIT_EXPORT_INTERVAL_BLOCKS: int
+    PRIVATE_AUDIT_EXPORT_POLL_INTERVAL_S: int
+    PRIVATE_AUDIT_EXPORT_PREFIX: str
+    PRIVATE_AUDIT_MANIFEST_INDEX_URL: str
     PRIVATE_AUDIT_TEMPO: int
     PRIVATE_AUDIT_MIN_SAMPLES: int
     PRIVATE_GHCR_NAMESPACE: str
@@ -164,6 +199,37 @@ class Settings(BaseModel):
     BENCHMARK_PRECISION_RECALL_THRESHOLDS: int
     BENCHMARK_AP_INTERPOLATION_POINTS: int
     BENCHMARK_MAX_VIDEO_DURATION_MINUTES: int
+    SCOREVISION_WINNERS_INDEX_URL: str
+    CHECKER_R2_BUCKET: str
+    CHECKER_R2_ACCOUNT_ID: SecretStr
+    CHECKER_R2_WRITE_ACCESS_KEY_ID: SecretStr
+    CHECKER_R2_WRITE_SECRET_ACCESS_KEY: SecretStr
+    CHECKER_R2_CONCURRENCY: int
+    CHECKER_R2_BUCKET_PUBLIC_URL: str
+    CHECKER_R2_RESULTS_PREFIX: str
+    CHECKER_INTERVAL_BLOCKS: int
+    CHECKER_POLL_INTERVAL_S: int
+    CHECKER_CHALLENGES_PER_TARGET: int
+    CHECKER_IOU_MATCH_THRESHOLD: float
+    CHECKER_OUTPUT_DRIFT_MAX_MISSING: int
+    CHECKER_OUTPUT_DRIFT_MAX_EXTRA: int
+    CHECKER_OUTPUT_DRIFT_MIN_MATCHED_IOU: float
+    CHECKER_OUTPUT_DRIFT_MAX_PER_TARGET: int
+    CHECKER_LATENCY_P95_MS: float
+    CHECKER_LATENCY_TOLERANCE_MS: float
+    CHECKER_LATENCY_FAIL_STREAK_THRESHOLD: int
+    CHECKER_MAX_MODEL_BYTES: int
+    CHECKER_RUNTIME_MEMORY_BYTES: int
+    CHECKER_RUNTIME_CPU_SECONDS: int
+    CHECKER_RUNTIME_WALL_TIMEOUT_S: int
+    CHECKER_R2_READ_ACCESS_KEY_ID: SecretStr
+    CHECKER_R2_READ_SECRET_ACCESS_KEY: SecretStr
+    CHECKER_SIGNING_WALLET: str
+    CHECKER_SIGNING_HOTKEY: str
+    LATENCY_LOOP_HOTKEY: str
+    FINAL_CHECKER_OUTPUT_KEY: str
+    FINAL_CHECKER_STATE_KEY: str
+    FINAL_CHECKER_POLL_INTERVAL_S: int
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -217,6 +283,7 @@ def get_settings() -> Settings:
             "https://{slug}.chutes.ai",
         ),
         CHUTES_API_KEY=getenv("CHUTES_API_KEY", ""),
+        CHUTES_HF_TOKEN=getenv("CHUTES_HF_TOKEN", ""),
         PATH_CHUTE_TEMPLATES=Path(
             getenv(
                 "PATH_CHUTE_TEMPLATES",
@@ -339,6 +406,7 @@ def get_settings() -> Settings:
         ),
         SCOREVISION_PUBLIC_MIN_CHALLENGES=int(getenv("SCOREVISION_PUBLIC_MIN_CHALLENGES", 30)),
         SCOREVISION_PUBLIC_EVAL_WINDOW_DAYS=float(getenv("SCOREVISION_PUBLIC_EVAL_WINDOW_DAYS", 3.0)),
+        SCOREVISION_FAILING_TUPLES_URL=_failing_tuples_url(),
         # Runner
         RUNNER_GET_BLOCK_TIMEOUT_S=float(getenv("SUBTENSOR_GET_BLOCK_TIMEOUT_S", 15.0)),
         RUNNER_WAIT_BLOCK_TIMEOUT_S=float(getenv("SUBTENSOR_WAIT_BLOCK_TIMEOUT_S", 15.0)),
@@ -368,9 +436,18 @@ def get_settings() -> Settings:
         PRIVATE_RESPONSES_R2_ACCOUNT_ID=getenv("PRIVATE_RESPONSES_R2_ACCOUNT_ID", ""),
         PRIVATE_RESPONSES_R2_WRITE_ACCESS_KEY_ID=getenv("PRIVATE_RESPONSES_R2_WRITE_ACCESS_KEY_ID", ""),
         PRIVATE_RESPONSES_R2_WRITE_SECRET_ACCESS_KEY=getenv("PRIVATE_RESPONSES_R2_WRITE_SECRET_ACCESS_KEY", ""),
+        PRIVATE_RESPONSES_R2_READ_ACCESS_KEY_ID=getenv("PRIVATE_RESPONSES_R2_READ_ACCESS_KEY_ID", ""),
+        PRIVATE_RESPONSES_R2_READ_SECRET_ACCESS_KEY=getenv("PRIVATE_RESPONSES_R2_READ_SECRET_ACCESS_KEY", ""),
         PRIVATE_RESPONSES_R2_PREFIX=getenv("PRIVATE_RESPONSES_R2_PREFIX", "private_responses"),
+        PRIVATE_AUDIT_EXPORT_INTERVAL_BLOCKS=int(getenv("PRIVATE_AUDIT_EXPORT_INTERVAL_BLOCKS", 7200)),
+        PRIVATE_AUDIT_EXPORT_POLL_INTERVAL_S=int(getenv("PRIVATE_AUDIT_EXPORT_POLL_INTERVAL_S", 60)),
+        PRIVATE_AUDIT_EXPORT_PREFIX=getenv("PRIVATE_AUDIT_EXPORT_PREFIX", "manako/audit"),
+        PRIVATE_AUDIT_MANIFEST_INDEX_URL=getenv(
+            "PRIVATE_AUDIT_MANIFEST_INDEX_URL",
+            "https://turbo.scoredata.me/manifest/index.json",
+        ),
         PRIVATE_AUDIT_TEMPO=int(getenv("PRIVATE_AUDIT_TEMPO", 100)),
-        PRIVATE_AUDIT_MIN_SAMPLES=int(getenv("PRIVATE_AUDIT_MIN_SAMPLES", 20)),
+        PRIVATE_AUDIT_MIN_SAMPLES=int(getenv("PRIVATE_AUDIT_MIN_SAMPLES", 30)),
         PRIVATE_GHCR_NAMESPACE=getenv("PRIVATE_GHCR_NAMESPACE", "scorevision"),
         PRIVATE_DOCKER_TIMEOUT_S=float(getenv("PRIVATE_DOCKER_TIMEOUT_S", 300.0)),
         PRIVATE_SPOTCHECK_MATCH_THRESHOLD=float(getenv("PRIVATE_SPOTCHECK_MATCH_THRESHOLD", 0.98)),
@@ -387,4 +464,48 @@ def get_settings() -> Settings:
         BENCHMARK_PRECISION_RECALL_THRESHOLDS=int(getenv("BENCHMARK_PRECISION_RECALL_THRESHOLDS", 200)),
         BENCHMARK_AP_INTERPOLATION_POINTS=int(getenv("BENCHMARK_AP_INTERPOLATION_POINTS", 11)),
         BENCHMARK_MAX_VIDEO_DURATION_MINUTES=int(getenv("BENCHMARK_MAX_VIDEO_DURATION_MINUTES", 120)),
+        SCOREVISION_WINNERS_INDEX_URL=getenv(
+            "SCOREVISION_WINNERS_INDEX_URL",
+            "https://turbo.scoredata.me/manako/winners/index.json",
+        ),
+        CHECKER_R2_BUCKET=getenv("CHECKER_R2_BUCKET", ""),
+        CHECKER_R2_ACCOUNT_ID=getenv("CHECKER_R2_ACCOUNT_ID", ""),
+        CHECKER_R2_WRITE_ACCESS_KEY_ID=getenv("CHECKER_R2_WRITE_ACCESS_KEY_ID", ""),
+        CHECKER_R2_WRITE_SECRET_ACCESS_KEY=getenv("CHECKER_R2_WRITE_SECRET_ACCESS_KEY", ""),
+        CHECKER_R2_CONCURRENCY=int(getenv("CHECKER_R2_CONCURRENCY", shared_r2_concurrency)),
+        CHECKER_R2_BUCKET_PUBLIC_URL=getenv("CHECKER_R2_BUCKET_PUBLIC_URL", ""),
+        CHECKER_R2_RESULTS_PREFIX=getenv("CHECKER_R2_RESULTS_PREFIX", "manako/compliances"),
+        CHECKER_INTERVAL_BLOCKS=int(getenv("CHECKER_INTERVAL_BLOCKS", 360)),
+        CHECKER_POLL_INTERVAL_S=int(getenv("CHECKER_POLL_INTERVAL_S", 60)),
+        CHECKER_CHALLENGES_PER_TARGET=int(getenv("CHECKER_CHALLENGES_PER_TARGET", 10)),
+        CHECKER_IOU_MATCH_THRESHOLD=float(getenv("CHECKER_IOU_MATCH_THRESHOLD", 0.95)),
+        CHECKER_OUTPUT_DRIFT_MAX_MISSING=int(getenv("CHECKER_OUTPUT_DRIFT_MAX_MISSING", 2)),
+        CHECKER_OUTPUT_DRIFT_MAX_EXTRA=int(getenv("CHECKER_OUTPUT_DRIFT_MAX_EXTRA", 2)),
+        CHECKER_OUTPUT_DRIFT_MIN_MATCHED_IOU=float(getenv("CHECKER_OUTPUT_DRIFT_MIN_MATCHED_IOU", 0.90)),
+        CHECKER_OUTPUT_DRIFT_MAX_PER_TARGET=int(getenv("CHECKER_OUTPUT_DRIFT_MAX_PER_TARGET", 2)),
+        CHECKER_LATENCY_P95_MS=float(getenv("CHECKER_LATENCY_P95_MS", 100.0)),
+        CHECKER_LATENCY_TOLERANCE_MS=float(getenv("CHECKER_LATENCY_TOLERANCE_MS", 10.0)),
+        CHECKER_LATENCY_FAIL_STREAK_THRESHOLD=int(getenv("CHECKER_LATENCY_FAIL_STREAK_THRESHOLD", 3)),
+        CHECKER_MAX_MODEL_BYTES=int(getenv("CHECKER_MAX_MODEL_BYTES", 31457280)),
+        CHECKER_RUNTIME_MEMORY_BYTES=int(getenv("CHECKER_RUNTIME_MEMORY_BYTES", 8589934592)),
+        CHECKER_RUNTIME_CPU_SECONDS=int(getenv("CHECKER_RUNTIME_CPU_SECONDS", 30)),
+        CHECKER_RUNTIME_WALL_TIMEOUT_S=int(getenv("CHECKER_RUNTIME_WALL_TIMEOUT_S", 45)),
+        # Path to the run-signing key: a root-only file, never an env variable.
+        # Read-only conformity token, owner side only: lets the final checker
+        # enumerate runs from the bucket instead of trusting a mutable index.
+        CHECKER_R2_READ_ACCESS_KEY_ID=getenv("CHECKER_R2_READ_ACCESS_KEY_ID", ""),
+        CHECKER_R2_READ_SECRET_ACCESS_KEY=getenv("CHECKER_R2_READ_SECRET_ACCESS_KEY", ""),
+        # Run signing wallet, resolved like the signer does. Leave the hotkey
+        # empty to run unsigned.
+        CHECKER_SIGNING_WALLET=getenv("CHECKER_SIGNING_WALLET", ""),
+        CHECKER_SIGNING_HOTKEY=getenv("CHECKER_SIGNING_HOTKEY", ""),
+        # ss58 address the final checker expects on every signed run.
+        LATENCY_LOOP_HOTKEY=getenv("LATENCY_LOOP_HOTKEY", ""),
+        FINAL_CHECKER_OUTPUT_KEY=getenv(
+            "FINAL_CHECKER_OUTPUT_KEY", "manako/conformity/failing_tuples.json"
+        ),
+        FINAL_CHECKER_STATE_KEY=getenv(
+            "FINAL_CHECKER_STATE_KEY", "manako/conformity/latency_state.json"
+        ),
+        FINAL_CHECKER_POLL_INTERVAL_S=int(getenv("FINAL_CHECKER_POLL_INTERVAL_S", 300)),
     )

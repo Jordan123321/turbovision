@@ -84,6 +84,12 @@ def run_signer_process():
     asyncio.run(run_signer())
 
 
+def run_public_compliance_process():
+    from scorevision.validator.audit.open_source.compliance import compliance_loop
+    setup_logging()
+    asyncio.run(compliance_loop())
+
+
 @click.group("audit-validator")
 def audit_validator():
     pass
@@ -261,6 +267,43 @@ def spotcheck_cmd(
         ))
 
 
+@open_source.command("final-checker")
+@click.option("--once", is_flag=True, help="Run one verification pass and exit")
+def final_checker_cmd(once: bool):
+    from scorevision.validator.audit.open_source.final_checker import (
+        final_checker_loop,
+        run_final_check_once,
+    )
+
+    setup_logging()
+    if once:
+        out = asyncio.run(run_final_check_once())
+        logger.info("Final check done: %s", out)
+        return
+    logger.info("Starting final checker loop")
+    asyncio.run(final_checker_loop())
+
+
+@open_source.command("compliance")
+@click.option("--once", is_flag=True, help="Run one compliance iteration and exit")
+def compliance_cmd(once: bool):
+    from scorevision.validator.audit.open_source.compliance import (
+        compliance_loop,
+        run_public_compliance_once,
+    )
+    setup_logging()
+    if once:
+        out = asyncio.run(run_public_compliance_once())
+        logger.info(
+            "Compliance run done: winners_block=%s targets=%s",
+            out.get("winners_block"),
+            out.get("targets"),
+        )
+        return
+    logger.info("Starting public compliance loop (block-based interval)")
+    asyncio.run(compliance_loop())
+
+
 @open_source.command("signer")
 def signer_cmd():
     from scorevision.validator.core import run_signer
@@ -343,6 +386,33 @@ def pt_spotcheck_cmd(
             threshold=threshold,
             commit_on_start=not no_commit,
         ))
+
+
+@private_track.command("export")
+@click.option("--once", is_flag=True, help="Run one private audit export and exit")
+@click.option(
+    "--trigger-block",
+    default=None,
+    type=int,
+    help="Block used as the output filename with --once",
+)
+def private_export_cmd(once: bool, trigger_block: int | None):
+    from scorevision.validator.audit.private_track.export import (
+        private_audit_export_loop,
+        run_private_audit_export_once,
+        setup_shutdown_handler,
+    )
+    setup_logging()
+    if once:
+        asyncio.run(run_private_audit_export_once(trigger_block))
+        return
+
+    async def run_loop():
+        setup_shutdown_handler()
+        await private_audit_export_loop()
+
+    logger.info("Starting block-scheduled private audit export loop")
+    asyncio.run(run_loop())
 
 
 @audit_validator.command("start")
@@ -433,5 +503,3 @@ def start_all_cmd(
             proc.join(timeout=5)
 
     logger.info("Audit validator shutdown complete")
-
-

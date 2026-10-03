@@ -1,4 +1,8 @@
+from collections import deque
+
 import pytest
+import scorevision.validator.scoring as scoring
+from scorevision.validator.core.weights import _top_rows
 from scorevision.validator.payload import (
     extract_miner_and_score,
     extract_miner_meta,
@@ -7,13 +11,22 @@ from scorevision.validator.payload import (
     extract_elements_from_manifest,
 )
 from scorevision.validator.scoring import (
+    aggregate_challenge_score_batches_by_miner,
     weighted_median,
     days_to_blocks,
     stake_of,
     are_similar_by_challenges,
+    pick_winner_with_tiebreak,
+    select_deterministic_historical_challenges,
+)
+from scorevision.validator.core.weights import (
+    _commit_block_for_hotkey,
+    _inactive_miners_for_element,
+    _private_ranked_weight_allocations,
+    _ranked_private_rows,
+    _top_rows,
 )
 from scorevision.validator.models import WeightsResult, OpenSourceMinerMeta
-from scorevision.validator.core.weights import _private_element_weight_share
 
 
 def test_extract_miner_and_score_from_payload_valid():
@@ -92,6 +105,50 @@ def test_stake_of_negative():
     assert stake_of("hk123", stake_by_hk) == 0.0
 
 
+def test_top_rows_excludes_zero_average_scores():
+    rows = [
+        {"hotkey": "zero-many", "uid": 1, "avg_score": 0.0, "n_challenges": 50},
+        {"hotkey": "positive-low", "uid": 2, "avg_score": 0.2, "n_challenges": 20},
+        {"hotkey": "positive-high", "uid": 3, "avg_score": 0.8, "n_challenges": 10},
+        {"hotkey": "insufficient", "uid": 4, "avg_score": 1.0, "n_challenges": 2},
+    ]
+
+    selected = _top_rows(rows, min_samples=10, top_k=3)
+
+    assert [row["hotkey"] for row in selected] == ["positive-high", "positive-low"]
+
+
+def test_inactive_miners_requires_strictly_more_than_lane_threshold():
+    rows = [
+        {"hotkey": "at-threshold", "avg_score": 0.0, "n_challenges": 30, "commit_block": 100},
+        {"hotkey": "inactive", "avg_score": 0.0, "n_challenges": 31, "commit_block": 101},
+        {"hotkey": "active", "avg_score": 0.1, "n_challenges": 50, "commit_block": 102},
+    ]
+
+    result = _inactive_miners_for_element(rows, element_id="element-a", min_shards=30)
+
+    assert result == [
+        {"hotkey": "inactive", "element_id": "element-a", "commit_block": 101}
+    ]
+
+
+def test_inactive_miners_uses_private_threshold_and_requires_commit_block():
+    rows = [
+        {"hotkey": "private-inactive", "avg_score": 0.0, "n_challenges": 21, "commit_block": 200},
+        {"hotkey": "missing-commit", "avg_score": 0.0, "n_challenges": 21},
+    ]
+
+    result = _inactive_miners_for_element(rows, element_id="element-private", min_shards=20)
+
+    assert result == [
+        {
+            "hotkey": "private-inactive",
+            "element_id": "element-private",
+            "commit_block": 200,
+        }
+    ]
+
+
 def test_extract_challenge_id_from_payload_task_id():
     payload = {"meta": {"task_id": "task123"}}
     assert extract_challenge_id(payload) == "task123"
@@ -140,6 +197,144 @@ def test_are_similar_by_challenges_two_failed_challenges_is_not_similar():
     assert are_similar_by_challenges(scores1, scores2, delta_abs=0.003, delta_rel=0.03) is False
 
 
+def test_aggregate_challenge_score_batches_returns_recent_ten_and_full_history():
+    rows = deque((f"c{i}", float(i)) for i in range(1, 21))
+
+    recent, history = aggregate_challenge_score_batches_by_miner(
+        {("validator", 1): rows},
+        batch_size=10,
+    )
+
+    assert list(history[1]) == [f"c{i}" for i in range(1, 21)]
+    assert list(recent[1]) == [f"c{i}" for i in range(11, 21)]
+
+
+def test_historical_sample_is_deterministic_and_ignores_input_order():
+    winner_history = {f"c{i}": float(i) for i in range(20)}
+    candidate_history = dict(reversed(list(winner_history.items())[:-1]))
+
+    first_winner, first_candidate = select_deterministic_historical_challenges(
+        winner_history,
+        candidate_history,
+        excluded_challenge_ids={"c0", "c1"},
+        current_window_id="block-12000",
+        sample_size=10,
+    )
+    second_winner, second_candidate = select_deterministic_historical_challenges(
+        dict(reversed(list(winner_history.items()))),
+        dict(reversed(list(candidate_history.items()))),
+        excluded_challenge_ids={"c1", "c0"},
+        current_window_id="block-12000",
+        sample_size=10,
+    )
+
+    assert list(first_winner) == list(second_winner)
+    assert list(first_candidate) == list(second_candidate)
+    assert len(first_winner) == 10
+    assert not ({"c0", "c1"} & set(first_winner))
+    assert set(first_winner) <= (set(winner_history) & set(candidate_history))
+
+
+def test_tiebreak_rejects_candidate_after_four_historical_differences():
+    winner_recent = {f"recent-{i}": 0.8 for i in range(10)}
+    candidate_recent = dict(winner_recent)
+    winner_previous = {f"previous-{i}": 0.8 for i in range(10)}
+    candidate_previous = dict(winner_previous)
+    candidate_previous["previous-0"] = 0.5
+    candidate_previous["previous-1"] = 0.5
+    candidate_previous["previous-2"] = 0.5
+    candidate_previous["previous-3"] = 0.5
+
+    winner_uid = pick_winner_with_tiebreak(
+        1,
+        uid_to_hk={1: "hk-winner", 2: "hk-candidate"},
+        recent_challenge_scores_by_miner={1: winner_recent, 2: candidate_recent},
+        historical_challenge_scores_by_miner={1: winner_previous, 2: candidate_previous},
+        current_window_id="block-12000",
+        candidate_uids={1, 2},
+        delta_abs=0.003,
+        delta_rel=0.03,
+        first_commit_block_by_hk={"hk-winner": 200, "hk-candidate": 100},
+        min_common_challenges=6,
+    )
+
+    assert winner_uid == 1
+
+
+def test_tiebreak_tolerates_three_historical_differences():
+    winner_recent = {f"recent-{i}": 0.8 for i in range(10)}
+    candidate_recent = dict(winner_recent)
+    winner_previous = {f"previous-{i}": 0.8 for i in range(10)}
+    candidate_previous = dict(winner_previous)
+    candidate_previous["previous-0"] = 0.5
+    candidate_previous["previous-1"] = 0.5
+    candidate_previous["previous-2"] = 0.5
+
+    winner_uid = pick_winner_with_tiebreak(
+        1,
+        uid_to_hk={1: "hk-winner", 2: "hk-candidate"},
+        recent_challenge_scores_by_miner={1: winner_recent, 2: candidate_recent},
+        historical_challenge_scores_by_miner={1: winner_previous, 2: candidate_previous},
+        current_window_id="block-12000",
+        candidate_uids={1, 2},
+        delta_abs=0.003,
+        delta_rel=0.03,
+        first_commit_block_by_hk={"hk-winner": 200, "hk-candidate": 100},
+        min_common_challenges=6,
+    )
+
+    assert winner_uid == 2
+
+
+def test_tiebreak_uses_commit_block_when_recent_and_historical_are_similar():
+    winner_recent = {f"recent-{i}": 0.8 for i in range(10)}
+    winner_previous = {f"previous-{i}": 0.8 for i in range(10)}
+
+    winner_uid = pick_winner_with_tiebreak(
+        1,
+        uid_to_hk={1: "hk-winner", 2: "hk-candidate"},
+        recent_challenge_scores_by_miner={1: winner_recent, 2: dict(winner_recent)},
+        historical_challenge_scores_by_miner={1: winner_previous, 2: dict(winner_previous)},
+        current_window_id="block-12000",
+        candidate_uids={1, 2},
+        delta_abs=0.003,
+        delta_rel=0.03,
+        first_commit_block_by_hk={"hk-winner": 200, "hk-candidate": 100},
+        min_common_challenges=6,
+    )
+
+    assert winner_uid == 2
+
+
+def test_tiebreak_short_circuits_historical_sample_when_recent_is_not_similar(monkeypatch):
+    calls = 0
+
+    def reject_recent_batch(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise AssertionError("historical sample must not be evaluated")
+        return False, {"reason": "score_delta_exceeded"}
+
+    monkeypatch.setattr(scoring, "_are_similar_by_challenges_debug", reject_recent_batch)
+
+    winner_uid = pick_winner_with_tiebreak(
+        1,
+        uid_to_hk={1: "hk-winner", 2: "hk-candidate"},
+        recent_challenge_scores_by_miner={1: {"c": 0.8}, 2: {"c": 0.1}},
+        historical_challenge_scores_by_miner={1: {"p": 0.8}, 2: {"p": 0.8}},
+        current_window_id="block-12000",
+        candidate_uids={1, 2},
+        delta_abs=0.003,
+        delta_rel=0.03,
+        first_commit_block_by_hk={"hk-winner": 200, "hk-candidate": 100},
+        min_common_challenges=6,
+    )
+
+    assert winner_uid == 1
+    assert calls == 1
+
+
 def test_weights_result_dataclass():
     result = WeightsResult(
         element_id="soccer_detect",
@@ -153,26 +348,69 @@ def test_weights_result_dataclass():
     assert result.scores_by_uid[7] == 0.9
 
 
-@pytest.mark.parametrize("groundtruth_type", ["cricket_delivery", "snooker_ball_state"])
-def test_private_score_scaled_element_share_for_cricket_and_snooker(groundtruth_type):
-    assert _private_element_weight_share(
-        elem_weight=0.05,
-        is_private=True,
-        groundtruth_type=groundtruth_type,
-        winner_score=0.5,
-    ) == pytest.approx(0.025)
+def test_top_rows_orders_by_score_samples_then_uid():
+    rows = [
+        {"hotkey": "hk3", "uid": 3, "avg_score": 0.8, "n_challenges": 30},
+        {"hotkey": "hk2", "uid": 2, "avg_score": 0.9, "n_challenges": 20},
+        {"hotkey": "hk1", "uid": 1, "avg_score": 0.9, "n_challenges": 20},
+        {"hotkey": "hk4", "uid": 4, "avg_score": 0.7, "n_challenges": 10},
+    ]
+
+    top = _top_rows(rows, min_samples=20, top_k=3)
+
+    assert [row["uid"] for row in top] == [1, 2, 3]
 
 
-def test_private_element_share_does_not_score_scale_soccer_or_public_elements():
-    assert _private_element_weight_share(
-        elem_weight=0.2,
-        is_private=True,
-        groundtruth_type="soccer_action",
-        winner_score=0.5,
-    ) == pytest.approx(0.2)
-    assert _private_element_weight_share(
-        elem_weight=0.05,
-        is_private=False,
-        groundtruth_type="snooker_ball_state",
-        winner_score=0.5,
-    ) == pytest.approx(0.05)
+def test_commit_block_for_winner_outside_top_three():
+    rows = [
+        {
+            "hotkey": f"hk{uid}",
+            "uid": uid,
+            "avg_score": 1.0 - uid / 10,
+            "n_challenges": 30,
+            "commit_block": 100 + uid,
+        }
+        for uid in range(1, 5)
+    ]
+
+    assert _commit_block_for_hotkey(rows, "hk4") == 104
+
+
+def test_ranked_private_rows_adds_rank_and_weight_share():
+    rows = [
+        {"hotkey": "hk10", "uid": 10, "avg_score": 0.95, "n_challenges": 30},
+        {"hotkey": "hk11", "uid": 11, "avg_score": 0.90, "n_challenges": 30},
+        {"hotkey": "hk12", "uid": 12, "avg_score": 0.85, "n_challenges": 30},
+    ]
+
+    ranked = _ranked_private_rows(rows, min_samples=20)
+
+    assert [row["rank"] for row in ranked] == [1, 2, 3]
+    assert [row["weight_share"] for row in ranked] == [0.80, 0.15, 0.05]
+
+
+def test_private_ranked_weight_allocations_uses_80_15_5_of_element_weight():
+    rows = [
+        {"hotkey": "winner", "uid": 5, "avg_score": 0.95, "n_challenges": 30},
+        {"hotkey": "second", "uid": 6, "avg_score": 0.90, "n_challenges": 30},
+        {"hotkey": "third", "uid": 7, "avg_score": 0.85, "n_challenges": 30},
+    ]
+
+    allocations = _private_ranked_weight_allocations(rows, elem_weight=0.5, min_samples=20)
+
+    assert [(uid, share) for uid, share, _row in allocations] == [
+        (5, 0.4),
+        (6, 0.075),
+        (7, 0.025),
+    ]
+
+
+def test_private_ranked_weight_allocations_ignores_zero_score_rows():
+    rows = [
+        {"hotkey": "zero", "uid": 5, "avg_score": 0.0, "n_challenges": 30},
+        {"hotkey": "winner", "uid": 6, "avg_score": 0.7, "n_challenges": 30},
+    ]
+
+    allocations = _private_ranked_weight_allocations(rows, elem_weight=1.0, min_samples=20)
+
+    assert [(uid, share) for uid, share, _row in allocations] == [(6, 0.8)]

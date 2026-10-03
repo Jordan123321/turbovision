@@ -52,7 +52,7 @@ services:
           "CMD",
           "/bin/sh",
           "-lc",
-          "if [ -z \"$${SCOREVISION_CENTRAL_VALIDATOR_HOTKEY:-}\" ]; then exit 0; fi; current=\"$$(python -c 'import os,bittensor as bt; w=bt.wallet(name=os.getenv(\"BITTENSOR_WALLET_COLD\",\"default\"), hotkey=os.getenv(\"BITTENSOR_WALLET_HOT\",\"default\")); print(w.hotkey.ss58_address)')\"; if [ \"$$current\" = \"$$SCOREVISION_CENTRAL_VALIDATOR_HOTKEY\" ]; then kill -0 1; else exit 0; fi",
+          "if [ -z \"$${SCOREVISION_CENTRAL_VALIDATOR_HOTKEY:-}\" ]; then exit 0; fi; current=\"$$(python -c 'import os,bittensor as bt; w=bt.Wallet(name=os.getenv(\"BITTENSOR_WALLET_COLD\",\"default\"), hotkey=os.getenv(\"BITTENSOR_WALLET_HOT\",\"default\")); print(w.hotkey.ss58_address)')\"; if [ \"$$current\" = \"$$SCOREVISION_CENTRAL_VALIDATOR_HOTKEY\" ]; then kill -0 1; else exit 0; fi",
         ]
       interval: 30s
       timeout: 10s
@@ -62,7 +62,7 @@ services:
       [
         "/bin/sh",
         "-lc",
-        "set -e; target=\"$${SCOREVISION_CENTRAL_VALIDATOR_HOTKEY:-}\"; if [ -z \"$$target\" ]; then echo \"[runner-gate] SCOREVISION_CENTRAL_VALIDATOR_HOTKEY not set -> runner disabled\"; exec sleep infinity; fi; current=\"$$(python -c 'import os,bittensor as bt; w=bt.wallet(name=os.getenv(\"BITTENSOR_WALLET_COLD\",\"default\"), hotkey=os.getenv(\"BITTENSOR_WALLET_HOT\",\"default\")); print(w.hotkey.ss58_address)')\"; echo \"[runner-gate] local_hotkey=$$current\"; echo \"[runner-gate] target_hotkey=$$target\"; if [ \"$$current\" = \"$$target\" ]; then echo \"[runner-gate] hotkey match -> starting central runner\"; exec sv -v central-validator open-source runner; fi; echo \"[runner-gate] hotkey mismatch -> runner disabled on this node\"; exec sleep infinity",
+        "set -e; target=\"$${SCOREVISION_CENTRAL_VALIDATOR_HOTKEY:-}\"; if [ -z \"$$target\" ]; then echo \"[runner-gate] SCOREVISION_CENTRAL_VALIDATOR_HOTKEY not set -> runner disabled\"; exec sleep infinity; fi; current=\"$$(python -c 'import os,bittensor as bt; w=bt.Wallet(name=os.getenv(\"BITTENSOR_WALLET_COLD\",\"default\"), hotkey=os.getenv(\"BITTENSOR_WALLET_HOT\",\"default\")); print(w.hotkey.ss58_address)')\"; echo \"[runner-gate] local_hotkey=$$current\"; echo \"[runner-gate] target_hotkey=$$target\"; if [ \"$$current\" = \"$$target\" ]; then echo \"[runner-gate] hotkey match -> starting central runner\"; exec sv -v central-validator open-source runner; fi; echo \"[runner-gate] hotkey mismatch -> runner disabled on this node\"; exec sleep infinity",
       ]
 
   central-private-runner:
@@ -86,7 +86,7 @@ services:
           "CMD",
           "/bin/sh",
           "-lc",
-          "if [ -z \"$${SCOREVISION_CENTRAL_VALIDATOR_HOTKEY:-}\" ]; then exit 0; fi; current=\"$$(python -c 'import os,bittensor as bt; w=bt.wallet(name=os.getenv(\"BITTENSOR_WALLET_COLD\",\"default\"), hotkey=os.getenv(\"BITTENSOR_WALLET_HOT\",\"default\")); print(w.hotkey.ss58_address)')\"; if [ \"$$current\" = \"$$SCOREVISION_CENTRAL_VALIDATOR_HOTKEY\" ]; then kill -0 1; else exit 0; fi",
+          "if [ -z \"$${SCOREVISION_CENTRAL_VALIDATOR_HOTKEY:-}\" ]; then exit 0; fi; current=\"$$(python -c 'import os,bittensor as bt; w=bt.Wallet(name=os.getenv(\"BITTENSOR_WALLET_COLD\",\"default\"), hotkey=os.getenv(\"BITTENSOR_WALLET_HOT\",\"default\")); print(w.hotkey.ss58_address)')\"; if [ \"$$current\" = \"$$SCOREVISION_CENTRAL_VALIDATOR_HOTKEY\" ]; then kill -0 1; else exit 0; fi",
         ]
       interval: 30s
       timeout: 10s
@@ -96,7 +96,7 @@ services:
       [
         "/bin/sh",
         "-lc",
-        "set -e; target=\"$${SCOREVISION_CENTRAL_VALIDATOR_HOTKEY:-}\"; if [ -z \"$$target\" ]; then echo \"[pt-runner-gate] SCOREVISION_CENTRAL_VALIDATOR_HOTKEY not set -> private runner disabled\"; exec sleep infinity; fi; current=\"$$(python -c 'import os,bittensor as bt; w=bt.wallet(name=os.getenv(\"BITTENSOR_WALLET_COLD\",\"default\"), hotkey=os.getenv(\"BITTENSOR_WALLET_HOT\",\"default\")); print(w.hotkey.ss58_address)')\"; echo \"[pt-runner-gate] local_hotkey=$$current\"; echo \"[pt-runner-gate] target_hotkey=$$target\"; if [ \"$$current\" = \"$$target\" ]; then echo \"[pt-runner-gate] hotkey match -> starting private-track runner\"; exec sv -v central-validator private-track runner; fi; echo \"[pt-runner-gate] hotkey mismatch -> private runner disabled on this node\"; exec sleep infinity",
+        "set -e; target=\"$${SCOREVISION_CENTRAL_VALIDATOR_HOTKEY:-}\"; if [ -z \"$$target\" ]; then echo \"[pt-runner-gate] SCOREVISION_CENTRAL_VALIDATOR_HOTKEY not set -> private runner disabled\"; exec sleep infinity; fi; current=\"$$(python -c 'import os,bittensor as bt; w=bt.Wallet(name=os.getenv(\"BITTENSOR_WALLET_COLD\",\"default\"), hotkey=os.getenv(\"BITTENSOR_WALLET_HOT\",\"default\")); print(w.hotkey.ss58_address)')\"; echo \"[pt-runner-gate] local_hotkey=$$current\"; echo \"[pt-runner-gate] target_hotkey=$$target\"; if [ \"$$current\" = \"$$target\" ]; then echo \"[pt-runner-gate] hotkey match -> starting private-track runner\"; exec sv -v central-validator private-track runner; fi; echo \"[pt-runner-gate] hotkey mismatch -> private runner disabled on this node\"; exec sleep infinity",
       ]
 
   central-signer:
@@ -136,6 +136,72 @@ services:
       - ${HOME}/.bittensor/wallets:/root/.bittensor/wallets:ro
       - ./blacklist:/app/blacklist:ro
     command: ["sv", "-v", "audit-validator", "open-source", "spotcheck"]
+
+  latency-conformity:
+    image: docker.io/mikhaelscore/turbovision-latency-conformity:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.latency_conformity
+    container_name: scorevision-latency-conformity
+    profiles: ["latency_conformity"]
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      MALLOC_ARENA_MAX: "2"
+      PYTHONMALLOC: "malloc"
+      CHECKER_SECURITY_FILE: ${CHECKER_SECURITY_FILE:-}
+      CHECKER_SECURITY_MODULE: ${CHECKER_SECURITY_MODULE:-}
+    mem_reservation: "6g"
+    mem_limit: "8g"
+    stop_grace_period: 30s
+    stop_signal: SIGTERM
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"
+    volumes:
+      - ${HOME}/.bittensor/wallets:/root/.bittensor/wallets:ro
+    command: ["sv", "-v", "audit-validator", "open-source", "compliance"]
+
+  latency-final-checker:
+    image: docker.io/mikhaelscore/turbovision-latency-final-checker:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.latency_final_checker
+    container_name: scorevision-latency-final-checker
+    profiles: ["latency_final_checker"]
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      MALLOC_ARENA_MAX: "2"
+      PYTHONMALLOC: "malloc"
+    mem_reservation: "512m"
+    mem_limit: "1g"
+    stop_grace_period: 30s
+    stop_signal: SIGTERM
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"
+    command: ["sv", "-v", "audit-validator", "open-source", "final-checker"]
+
+  private-audit-export:
+    image: docker.io/mikhaelscore/turbovision-private-audit-export:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.private_audit_export
+    container_name: scorevision-private-audit-export
+    profiles: ["private_audit_export"]
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      MALLOC_ARENA_MAX: "2"
+      PYTHONMALLOC: "malloc"
+    mem_reservation: "512m"
+    mem_limit: "1g"
+    stop_grace_period: 30s
+    stop_signal: SIGTERM
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"
+    volumes:
+      - ${HOME}/.bittensor/wallets:/root/.bittensor/wallets:ro
+    command: ["sv", "-v", "audit-validator", "private-track", "export"]
 
   prometheus:
     image: prom/prometheus:latest

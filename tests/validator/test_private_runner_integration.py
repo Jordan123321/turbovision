@@ -1,10 +1,12 @@
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
+import scorevision.validator.central.private_track.runner as runner_mod
 from scorevision.utils.manifest import Element, Manifest, Metrics, PillarName, Tee
+from scorevision.utils.r2 import R2Config
 from scorevision.utils.schemas import (
     ChallengeResponse,
     CricketDeliveryPrediction,
@@ -14,11 +16,67 @@ from scorevision.utils.schemas import (
     SnookerBallStatePrediction,
 )
 from scorevision.validator.central.private_track.challenges import Challenge
+from scorevision.validator.central.private_track.miners import ChallengeAttempt
 from scorevision.validator.central.private_track.registry import RegisteredMiner
 from scorevision.validator.central.private_track.runner import (
     _run_challenge_for_element,
     _trigger_scheduled_runners,
 )
+
+
+class _FakeClientContext:
+    def __init__(self, client):
+        self.client = client
+
+    async def __aenter__(self):
+        return self.client
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+
+@pytest.mark.asyncio
+async def test_private_r2_upload_propagates_diagnostic_trace_to_index():
+    client = SimpleNamespace(put_object=AsyncMock())
+    add_index = AsyncMock(return_value=True)
+    logger = Mock()
+    cfg = R2Config(
+        bucket="private-bucket",
+        account_id="account",
+        access_key_id="access",
+        secret_access_key="secret",
+        concurrency=1,
+    )
+
+    with (
+        patch.object(runner_mod, "_private_responses_r2_config", return_value=cfg),
+        patch.object(
+            runner_mod,
+            "create_s3_client",
+            return_value=_FakeClientContext(client),
+        ),
+        patch.object(runner_mod, "add_index_key_if_new", new=add_index),
+        patch.object(runner_mod, "logger", new=logger),
+    ):
+        result = await runner_mod._upload_to_private_r2(
+            "private_responses/object.json",
+            "private_responses/index.json",
+            {"predictions": [1, 2, 3]},
+            "response blob",
+            trace_id="private-response:element:hotkey:challenge",
+        )
+
+    assert result == "private_responses/object.json"
+    add_index.assert_awaited_once()
+    index_kwargs = add_index.await_args.kwargs
+    assert callable(index_kwargs["client_factory"])
+    assert index_kwargs["bucket"] == "private-bucket"
+    assert index_kwargs["key"] == "private_responses/object.json"
+    assert index_kwargs["index_key"] == "private_responses/index.json"
+    assert index_kwargs["trace_id"] == "private-response:element:hotkey:challenge"
+    messages = [call.args[0] for call in logger.info.call_args_list]
+    assert any("stage=object_put status=start" in message for message in messages)
+    assert any("status=released hold_ms=" in message for message in messages)
 
 
 def _private_manifest() -> Manifest:
@@ -193,6 +251,10 @@ async def test_run_challenge_for_element_soccer_uses_soccer_pillars_and_uploads_
             new=AsyncMock(return_value=_soccer_challenge()),
         ),
         patch(
+            "scorevision.validator.central.private_track.runner.send_challenge",
+            new=AsyncMock(return_value=ChallengeAttempt(None, 0.0, True)),
+        ),
+        patch(
             "scorevision.validator.central.private_track.runner._challenge_miner",
             new=challenge_miner_mock,
         ),
@@ -269,6 +331,10 @@ async def test_run_challenge_for_element_cricket_uses_cricket_pillars_and_upload
         patch(
             "scorevision.validator.central.private_track.runner.get_challenge_with_ground_truth",
             new=AsyncMock(return_value=_cricket_challenge()),
+        ),
+        patch(
+            "scorevision.validator.central.private_track.runner.send_challenge",
+            new=AsyncMock(return_value=ChallengeAttempt(None, 0.0, True)),
         ),
         patch(
             "scorevision.validator.central.private_track.runner._challenge_miner",
@@ -359,6 +425,10 @@ async def test_run_challenge_for_element_snooker_uses_snooker_pillars_and_upload
         patch(
             "scorevision.validator.central.private_track.runner.get_challenge_with_ground_truth",
             new=AsyncMock(return_value=_snooker_challenge()),
+        ),
+        patch(
+            "scorevision.validator.central.private_track.runner.send_challenge",
+            new=AsyncMock(return_value=ChallengeAttempt(None, 0.0, True)),
         ),
         patch(
             "scorevision.validator.central.private_track.runner._challenge_miner",
@@ -529,6 +599,10 @@ async def test_run_challenge_for_element_mixed_timeout_and_success_are_both_shar
             new=AsyncMock(return_value=_soccer_challenge()),
         ),
         patch(
+            "scorevision.validator.central.private_track.runner.send_challenge",
+            new=AsyncMock(return_value=ChallengeAttempt(None, 0.0, True)),
+        ),
+        patch(
             "scorevision.validator.central.private_track.runner._challenge_miner",
             new=challenge_miner_mock,
         ),
@@ -622,6 +696,10 @@ async def test_run_challenge_for_element_continues_when_emit_private_score_fails
             new=AsyncMock(return_value=_soccer_challenge()),
         ),
         patch(
+            "scorevision.validator.central.private_track.runner.send_challenge",
+            new=AsyncMock(return_value=ChallengeAttempt(None, 0.0, True)),
+        ),
+        patch(
             "scorevision.validator.central.private_track.runner._challenge_miner",
             new=AsyncMock(
                 return_value=(
@@ -666,3 +744,85 @@ async def test_run_challenge_for_element_continues_when_emit_private_score_fails
         )
 
     assert upload_shard_mock.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_run_challenge_collects_all_network_responses_before_scoring():
+    manifest = _private_manifest()
+    miners = [_miner(uid, f"hk-{uid}") for uid in range(20, 170)]
+    settings = SimpleNamespace(
+        BLACKLIST_API_URL="",
+        SCOREVISION_NETUID=44,
+        PRIVATE_MINER_TIMEOUT_S=30.0,
+    )
+    subtensor = SimpleNamespace(metagraph=AsyncMock(return_value=SimpleNamespace()))
+    completed_receives = 0
+
+    async def _receive(*_args, **_kwargs):
+        nonlocal completed_receives
+        await asyncio.sleep(0)
+        completed_receives += 1
+        return ChallengeAttempt(response=None, elapsed_s=1.0, timed_out=True)
+
+    async def _score(miner, challenge, *_args, **_kwargs):
+        assert completed_receives == len(miners)
+        return (
+            {
+                "challenge_id": challenge.challenge_id,
+                "element_id": "manako/DetectCricketDelivery",
+                "miner_hotkey": miner.hotkey,
+                "miner_uid": miner.uid,
+                "score": 0.0,
+                "prediction_count": 0,
+                "ground_truth_count": 1,
+                "processing_time": 1.0,
+                "response_time_s": 1.0,
+                "timed_out": True,
+                "image_digest": miner.image_digest,
+                "score_breakdown": {},
+            },
+            None,
+            None,
+        )
+
+    send_mock = AsyncMock(side_effect=_receive)
+    with (
+        patch("scorevision.validator.central.private_track.runner.get_settings", return_value=settings),
+        patch(
+            "scorevision.validator.central.private_track.runner.get_registered_miners",
+            new=AsyncMock(return_value=miners),
+        ),
+        patch(
+            "scorevision.validator.central.private_track.runner.get_challenge_with_ground_truth",
+            new=AsyncMock(return_value=_cricket_challenge()),
+        ),
+        patch(
+            "scorevision.validator.central.private_track.runner.send_challenge",
+            new=send_mock,
+        ),
+        patch(
+            "scorevision.validator.central.private_track.runner._challenge_miner",
+            new=AsyncMock(side_effect=_score),
+        ),
+        patch(
+            "scorevision.validator.central.private_track.runner._upload_private_response_blob",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "scorevision.validator.central.private_track.runner._emit_private_score_to_public_db",
+            new=AsyncMock(),
+        ),
+        patch(
+            "scorevision.validator.central.private_track.runner._upload_shard",
+            new=AsyncMock(return_value="privatevision_results/shard.json"),
+        ),
+    ):
+        await _run_challenge_for_element(
+            element_id="manako/DetectCricketDelivery",
+            manifest=manifest,
+            block=9007,
+            keypair=SimpleNamespace(ss58_address="validator-hk"),
+            subtensor=subtensor,
+        )
+
+    assert send_mock.await_count == len(miners)

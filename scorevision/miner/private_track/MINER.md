@@ -193,6 +193,7 @@ Current private elements are served as separate tracks from the miner point of v
 - Football private element (`groundtruth_type=soccer_action`)
 - Cricket private element (`groundtruth_type=cricket_delivery`)
 - Snooker ball-state private element (`groundtruth_type=snooker_ball_state`)
+- TCG grading private element (`groundtruth_type=tcg_grading`)
 
 The template miner uses a static mode switch in `scorevision/miner/private_track/routes.py`:
 
@@ -200,7 +201,11 @@ The template miner uses a static mode switch in `scorevision/miner/private_track
 MINER_MODE = "soccer_action"  # or "cricket_delivery" or "snooker_ball_state"
 ```
 
-Keep one deployment per mode. Do not expect one running container to handle both private element types automatically.
+The registry selects miners by their committed `element_id`. TCG requests use
+`image_url`, while football, cricket, and snooker requests use their video/frame
+contract. No `groundtruth_type` field is sent to miners.
+
+Keep one deployment per element.
 
 ### 1.2 Response Contract (Important)
 
@@ -238,8 +243,29 @@ Keep one deployment per mode. Do not expect one running container to handle both
 }
 ```
 
+- For TCG grading:
+
+```json
+{
+  "challenge_id": "123",
+  "prediction": {
+    "Header": {
+      "card_grade": 8
+    },
+    "Grading_Features": {
+      "subgrade_surface": 7,
+      "subgrade_centering": 9,
+      "subgrade_edges": 8,
+      "subgrade_corners": 8
+    }
+  },
+  "processing_time": 0.42
+}
+```
+
 For full cricket field guidance, see `scorevision/miner/CRICKET_MINER_SPEC.md`.
 For snooker ball-state guidance, see `scorevision/miner/private_track/SNOOKER_MINER_SPEC.md`.
+For the TCG contract and scoring, see `scorevision/miner/private_track/TCG_GRADING_MINER_SPEC.md`.
 
 ### 1.3 On-Chain Commitment Must Match Element
 
@@ -257,7 +283,7 @@ Example commitment shape (conceptual):
 }
 ```
 
-If you serve cricket or snooker, use that element id instead.
+If you serve cricket, snooker, or TCG grading, use that element id instead.
 
 ### 2. Test Locally (Without Wallet)
 
@@ -320,12 +346,12 @@ The CLI will:
 
 After deployment, **share with Score** (see [GHCR Setup](#ghcr-setup) step 4).
 
-## Private Miner Checklist (Football / Cricket / Snooker)
+## Private Miner Checklist (Football / Cricket / Snooker / TCG Grading)
 
 Before declaring your miner live:
 
-1. Set `MINER_MODE` to the intended private element type.
-2. Ensure predictor output matches the expected response payload (`soccer_action.items`, `cricket_delivery.item`, or `snooker_ball_state.frames`).
+1. Set `MINER_MODE` to the intended video element type; TCG requests are identified by `image_url`.
+2. Ensure predictor output matches the expected response payload (`soccer_action.items`, `cricket_delivery.item`, `snooker_ball_state.frames`, or the TCG grading contract above).
 3. Deploy image and commit with the correct private `element_id`.
 4. Verify your axon IP/port is reachable.
 5. Confirm Score has GHCR read access to your package.

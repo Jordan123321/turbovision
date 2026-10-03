@@ -10,6 +10,7 @@ from scorevision.utils.schemas import (
     SnookerBallPrediction,
     SnookerBallStateFrame,
     SnookerBallStatePrediction,
+    TCGGradingPrediction,
 )
 
 
@@ -203,3 +204,36 @@ async def test_get_challenge_rejects_snooker_without_target_frames():
     assert challenge is None
     complete_mock.assert_not_awaited()
     fetch_gt_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_get_challenge_accepts_tcg_image_and_ground_truth():
+    fake_chal = {
+        "task_id": "76738",
+        "payload": {"image_url": "https://example.com/card.png"},
+    }
+    tcg_gt = TCGGradingPrediction(
+        Header={"card_grade": 6.0},
+        Grading_Features={
+            "subgrade_surface": 5.0,
+            "subgrade_centering": 10.0,
+            "subgrade_edges": 9.0,
+            "subgrade_corners": 9.0,
+        },
+    )
+
+    with _patch_settings(), \
+         patch(f"{_MODULE}.fetch_next_challenge", new_callable=AsyncMock, return_value=fake_chal), \
+         patch(f"{_MODULE}.complete_task_assignment", new_callable=AsyncMock), \
+         patch(f"{_MODULE}.fetch_ground_truth", new_callable=AsyncMock, return_value=tcg_gt):
+        challenge = await get_challenge_with_ground_truth(
+            manifest_hash="abc123",
+            element_id="manako/TCGGrading",
+            keypair=None,
+            groundtruth_type="tcg_grading",
+            max_retries=1,
+        )
+
+    assert challenge is not None
+    assert challenge.image_url == "https://example.com/card.png"
+    assert challenge.groundtruth_type == "tcg_grading"

@@ -3,6 +3,7 @@ import gc
 import os
 from logging import getLogger
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Optional, Dict
 
 from scorevision.miner.open_source.chute_template.schemas import TVPredictInput
@@ -51,6 +52,7 @@ from scorevision.utils.windows import get_current_window_id, get_window_start_bl
 from scorevision.validator.central.scheduling import (
     cancel_removed_element_tasks,
     extract_element_tempos,
+    get_due_trigger_block,
     load_manifest,
     setup_shutdown_handler,
     to_pos_int,
@@ -81,7 +83,18 @@ _EMIT_SHARD_SEM = asyncio.Semaphore(_emit_shard_concurrency())
 
 
 async def _emit_shard_guarded(**kwargs) -> None:
+    queued_at = perf_counter()
+    label = (
+        f"{kwargs.get('element_id') or 'unknown'}:"
+        f"{str(kwargs.get('miner_hotkey_ss58') or 'unknown')[:6]}"
+    )
     async with _EMIT_SHARD_SEM:
+        logger.info(
+            "[emit-queue:%s] status=acquired wait_ms=%.1f concurrency=%d",
+            label,
+            (perf_counter() - queued_at) * 1000.0,
+            _emit_shard_concurrency(),
+        )
         await emit_shard(**kwargs)
 
 
@@ -358,17 +371,23 @@ def _trigger_scheduled_runners(element_state: Dict[str, Dict[str, Any]], block: 
         tempo = max(1, int(entry["tempo"]))
         anchor = int(entry["anchor"])
         task = entry.get("task")
-        delta = block - anchor
-        should_trigger = (delta >= 0) and (delta % tempo == 0)
+        trigger_block = get_due_trigger_block(entry, block)
 
-        if not should_trigger:
+        if trigger_block is None:
             continue
 
         if task is not None and not task.done():
-            logger.info("[RunnerLoop] element_id=%s still running; skipping trigger at block=%s", element_id, block)
+            logger.info("[RunnerLoop] element_id=%s still running; skipping trigger at block=%s", element_id, trigger_block)
         else:
-            logger.info("[RunnerLoop] Triggering runner for element_id=%s at block=%s (tempo=%s anchor=%s)", element_id, block, tempo, anchor)
-            entry["task"] = asyncio.create_task(runner(block_number=block, manifest=manifest, element_id=element_id))
+            if trigger_block != block:
+                logger.warning(
+                    "[RunnerLoop] Caught up missed trigger for element_id=%s scheduled_block=%s current_block=%s",
+                    element_id,
+                    trigger_block,
+                    block,
+                )
+            logger.info("[RunnerLoop] Triggering runner for element_id=%s at block=%s (tempo=%s anchor=%s)", element_id, trigger_block, tempo, anchor)
+            entry["task"] = asyncio.create_task(runner(block_number=trigger_block, manifest=manifest, element_id=element_id))
 
 
 async def runner(
@@ -636,6 +655,13 @@ async def runner(
                 str(getattr(miner, "registry_skip_reason", "") or "").strip()
                 or "unknown_registry_filter"
             )
+            evaluation_details = {
+                "registry_skipped": True,
+                "registry_skip_reason": skip_reason,
+            }
+            skip_details = getattr(miner, "registry_skip_details", None)
+            if isinstance(skip_details, dict) and skip_details:
+                evaluation_details["registry_skip_details"] = skip_details
             zero_output = SVRunOutput(
                 success=False,
                 latency_ms=0.0,
@@ -652,10 +678,7 @@ async def runner(
                 acc=0.0,
                 latency_ms=0.0,
                 score=0.0,
-                details={
-                    "registry_skipped": True,
-                    "registry_skip_reason": skip_reason,
-                },
+                details=evaluation_details,
                 latency_p95_ms=0.0,
                 latency_pass=False,
                 rtf=None,
@@ -749,7 +772,12 @@ async def runner_loop(path_manifest: Path | None = None):
                 try:
                     subtensor = await get_subtensor()
                 except Exception as e:
-                    logger.warning("[RunnerLoop] subtensor connect failed: %s → retrying in %.1fs", e, reconnect_delay)
+                    logger.warning(
+                        "[RunnerLoop] subtensor connect failed: %s: %r → retrying in %.1fs",
+                        type(e).__name__,
+                        e,
+                        reconnect_delay,
+                    )
                     reset_subtensor()
                     subtensor = None
                     await asyncio.sleep(reconnect_delay)
@@ -763,8 +791,13 @@ async def runner_loop(path_manifest: Path | None = None):
                 subtensor = None
                 await asyncio.sleep(2.0)
                 continue
-            except (KeyError, ConnectionError, RuntimeError) as err:
-                logger.warning("[RunnerLoop] get_current_block error (%s) → resetting subtensor", err)
+            except Exception as err:
+                logger.warning(
+                    "[RunnerLoop] get_current_block error (%s: %r) → resetting subtensor",
+                    type(err).__name__,
+                    err,
+                    exc_info=True,
+                )
                 reset_subtensor()
                 subtensor = None
                 await asyncio.sleep(2.0)
@@ -775,13 +808,23 @@ async def runner_loop(path_manifest: Path | None = None):
             try:
                 new_manifest = await load_manifest(path_manifest, settings, block)
             except Exception as e:
-                logger.error("[RunnerLoop] Failed to load Manifest at block %s: %s", block, e)
+                logger.error(
+                    "[RunnerLoop] Failed to load Manifest at block %s: %s: %r",
+                    block,
+                    type(e).__name__,
+                    e,
+                )
                 try:
                     await asyncio.wait_for(subtensor.wait_for_block(), timeout=wait_block_timeout)
                 except asyncio.TimeoutError:
                     continue
-                except (KeyError, ConnectionError, RuntimeError) as err:
-                    logger.warning("[RunnerLoop] wait_for_block error (%s); resetting subtensor", err)
+                except Exception as err:
+                    logger.warning(
+                        "[RunnerLoop] wait_for_block error (%s: %r); resetting subtensor",
+                        type(err).__name__,
+                        err,
+                        exc_info=True,
+                    )
                     reset_subtensor()
                     subtensor = None
                     await asyncio.sleep(2.0)
@@ -807,8 +850,13 @@ async def runner_loop(path_manifest: Path | None = None):
                 await asyncio.wait_for(subtensor.wait_for_block(), timeout=wait_block_timeout)
             except asyncio.TimeoutError:
                 continue
-            except (KeyError, ConnectionError, RuntimeError) as err:
-                logger.warning("[RunnerLoop] wait_for_block error (%s); resetting subtensor", err)
+            except Exception as err:
+                logger.warning(
+                    "[RunnerLoop] wait_for_block error (%s: %r); resetting subtensor",
+                    type(err).__name__,
+                    err,
+                    exc_info=True,
+                )
                 reset_subtensor()
                 subtensor = None
                 await asyncio.sleep(2.0)
@@ -818,11 +866,15 @@ async def runner_loop(path_manifest: Path | None = None):
             break
 
         except Exception as e:
-            logger.warning("[RunnerLoop] Error: %s; resetting subtensor and retrying...", e)
+            logger.exception(
+                "[RunnerLoop] Error: %s: %r; resetting subtensor and retrying...",
+                type(e).__name__,
+                e,
+            )
             reset_subtensor()
             subtensor = None
             try:
-                await asyncio.wait_for(shutdown_event.wait(), timeout=120.0)
+                await asyncio.wait_for(shutdown_event.wait(), timeout=reconnect_delay)
             except asyncio.TimeoutError:
                 pass
 

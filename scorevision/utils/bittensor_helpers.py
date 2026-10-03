@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import asyncio
 import os
 from pathlib import Path
@@ -7,13 +5,19 @@ from base64 import b64decode
 from json import load, dumps, loads
 from logging import getLogger
 from traceback import print_exc
-from typing import Optional, TYPE_CHECKING
+from typing import Optional
 
-if TYPE_CHECKING:
-    from substrateinterface import Keypair
+from bittensor_wallet import Keypair
+from bittensor import AsyncSubtensor, Wallet
 
 from scorevision.utils.settings import get_settings
 from scorevision.utils.huggingface_helpers import get_huggingface_repo_name
+from scorevision.utils.bittensor_commitments import get_all_revealed_commitments
+from scorevision.utils.commit_recovery import (
+    RECOVERY_COMMIT_ROLE,
+    is_recovery_commit,
+    recover_commitments_from_shards,
+)
 
 logger = getLogger(__name__)
 
@@ -120,8 +124,6 @@ def get_last_update_for_hotkey(
 
 
 def load_hotkey_keypair(wallet_name: str, hotkey_name: str) -> Keypair:
-    from substrateinterface import Keypair
-
     settings = get_settings()
 
     wallet_dir = Path(settings.BITTENSOR_WALLET_PATH).expanduser()
@@ -153,9 +155,7 @@ async def get_subtensor():
     init_timeout = float(os.getenv("SUBTENSOR_INIT_TIMEOUT_S", "15.0"))
 
     async def _init(ep: str):
-        from bittensor import async_subtensor
-
-        st = async_subtensor(ep)
+        st = AsyncSubtensor(network=ep)
         await asyncio.wait_for(st.initialize(), timeout=init_timeout)
         return st
 
@@ -164,7 +164,12 @@ async def get_subtensor():
             logger.info("Initializing subtensor on %s", endpoint)
             _SUBTENSOR = await _init(endpoint)
         except Exception as e:
-            logger.error("Subtensor init failed for %s: %s", endpoint, e)
+            logger.error(
+                "Subtensor init failed for %s: %s: %r",
+                endpoint,
+                type(e).__name__,
+                e,
+            )
             raise
     return _SUBTENSOR
 
@@ -174,18 +179,17 @@ def reset_subtensor():
     global _SUBTENSOR
     _SUBTENSOR = None
 
+
 async def on_chain_commit(
     skip: bool,
     revision: str,
     chute_id: str,
     chute_slug: str | None,
     element_id: str | None,
-) -> None:
-    from bittensor import wallet
-
+) -> bool:
     settings = get_settings()
     repo_name = get_huggingface_repo_name()
-    w = wallet(
+    w = Wallet(
         name=settings.BITTENSOR_WALLET_COLD,
         hotkey=settings.BITTENSOR_WALLET_HOT,
     )
@@ -201,23 +205,66 @@ async def on_chain_commit(
         payload["element_id"] = str(element_id)
 
     logger.info(f"Commit payload: {payload}")
-    try:
-        if skip:
-            raise Exception(
-                f"No chute_id/slug; skipping on-chain commit for now. Payload would be: {payload}"
-            )
+    if skip:
+        logger.info("On-chain commit skipped. Payload would be: %s", payload)
+        return False
 
+    try:
         sub = await get_subtensor()
 
-        await sub.set_reveal_commitment(
+        response = await sub.set_reveal_commitment(
             wallet=w,
             netuid=settings.SCOREVISION_NETUID,
             data=dumps(payload),
             blocks_until_reveal=1,
+            raise_error=True,
         )
+        if not response.success:
+            raise RuntimeError(response.message or "On-chain commitment failed")
         logger.info("On-chain commitment submitted.")
+        return True
     except Exception as e:
-        logger.error(f"(Dry-run) On-chain commit skipped: {type(e).__name__}: {e}")
+        logger.error("On-chain commitment failed: %s: %s", type(e).__name__, e)
+        return False
+
+
+async def on_chain_commit_recover(*, element_id: str, skip: bool = False) -> bool:
+    """Publish a minimal request to restore a public miner commitment from shards."""
+    normalized_element_id = str(element_id or "").strip()
+    if not normalized_element_id:
+        raise ValueError("element_id is required for commitment recovery")
+
+    settings = get_settings()
+    wallet = Wallet(
+        name=settings.BITTENSOR_WALLET_COLD,
+        hotkey=settings.BITTENSOR_WALLET_HOT,
+    )
+    payload = {
+        "role": RECOVERY_COMMIT_ROLE,
+        "element_id": normalized_element_id,
+        "hotkey": wallet.hotkey.ss58_address,
+    }
+    logger.info("Commit recovery payload: %s", payload)
+    if skip:
+        logger.info("On-chain commit recovery skipped. Payload would be: %s", payload)
+        return False
+
+    try:
+        subtensor = await get_subtensor()
+        response = await subtensor.set_reveal_commitment(
+            wallet=wallet,
+            netuid=settings.SCOREVISION_NETUID,
+            data=dumps(payload),
+            blocks_until_reveal=1,
+            raise_error=True,
+        )
+        if not response.success:
+            raise RuntimeError(response.message or "On-chain commit recovery failed")
+        logger.info("On-chain commit recovery submitted.")
+        return True
+    except Exception as e:
+        logger.error("On-chain commit recovery failed: %s: %s", type(e).__name__, e)
+        return False
 
 
 async def _set_weights_with_confirmation(
@@ -241,8 +288,8 @@ async def _set_weights_with_confirmation(
             st = await get_subtensor()
             ref = await st.get_current_block()
             # soumission (sync) via client non-async
-            success, message = bt.subtensor(
-                os.getenv("BITTENSOR_SUBTENSOR_ENDPOINT", "finney")
+            success, message = bt.Subtensor(
+                network=os.getenv("BITTENSOR_SUBTENSOR_ENDPOINT", "finney")
             ).set_weights(
                 wallet=wallet,
                 netuid=netuid,
@@ -322,10 +369,8 @@ async def _set_weights_with_confirmation(
 
 async def on_chain_commit_validator(index_url: str) -> None:
     """ """
-    from bittensor import wallet
-
     settings = get_settings()
-    w = wallet(
+    w = Wallet(
         name=settings.BITTENSOR_WALLET_COLD,
         hotkey=settings.BITTENSOR_WALLET_HOT,
     )
@@ -356,7 +401,7 @@ async def get_validator_indexes_from_chain(netuid: int | None = None) -> dict[st
     netuid = netuid if netuid is not None else settings.SCOREVISION_NETUID
     st = await get_subtensor()
     meta = await st.metagraph(netuid, mechid=settings.SCOREVISION_MECHID)
-    commits = await st.get_all_revealed_commitments(netuid)
+    commits = await get_all_revealed_commitments(st, netuid)
 
     target_hotkey = (settings.SCOREVISION_CENTRAL_VALIDATOR_HOTKEY or "").strip()
     if not target_hotkey:
@@ -396,11 +441,9 @@ async def _already_committed_same_index(netuid: int, index_url: str) -> bool:
     settings = get_settings()
     st = await get_subtensor()
     meta = await st.metagraph(netuid, mechid=settings.SCOREVISION_MECHID)
-    commits = await st.get_all_revealed_commitments(netuid)
+    commits = await get_all_revealed_commitments(st, netuid)
 
-    from bittensor import wallet
-
-    w = wallet(
+    w = Wallet(
         name=settings.BITTENSOR_WALLET_COLD,
         hotkey=settings.BITTENSOR_WALLET_HOT,
     )
@@ -437,7 +480,7 @@ async def _first_commit_block_by_miner(
             settings = get_settings()
 
             meta = await st.metagraph(netuid, mechid=settings.SCOREVISION_MECHID)
-            commits = await st.get_all_revealed_commitments(netuid)
+            commits = await get_all_revealed_commitments(st, netuid)
 
             wanted_element_id = str(element_id).strip() if element_id is not None else None
             wanted_hotkeys = set(candidate_hotkeys or [])
@@ -445,6 +488,7 @@ async def _first_commit_block_by_miner(
             resolved_first_block = max(0, int(first_block or 0))
             last_block_by_hk: dict[str, int] = {}
             unresolved_for_backfill: list[tuple[str, list]] = []
+            unresolved_for_recovery: list[tuple[str, int]] = []
             for hk in meta.hotkeys:
                 if wanted_hotkeys and hk not in wanted_hotkeys:
                     continue
@@ -453,6 +497,7 @@ async def _first_commit_block_by_miner(
                     continue
 
                 last_block = None
+                latest_is_recovery = False
                 for tup in arr:
                     try:
                         blk, data = tup
@@ -464,9 +509,15 @@ async def _first_commit_block_by_miner(
                     except Exception:
                         continue
 
+                    is_recovery = False
                     if isinstance(obj, dict):
                         role = obj.get("role")
-                        if role != "miner":
+                        is_recovery = wanted_element_id is not None and is_recovery_commit(
+                            obj,
+                            wanted_element_id,
+                            hotkey=hk,
+                        )
+                        if role != "miner" and not is_recovery:
                             continue
                         committed_eid = obj.get("element_id")
                         committed_eid = (
@@ -482,13 +533,53 @@ async def _first_commit_block_by_miner(
 
                     if last_block is None or blk_int > last_block:
                         last_block = blk_int
+                        latest_is_recovery = is_recovery
 
                 if last_block is not None:
-                    last_block_by_hk[hk] = last_block
+                    if latest_is_recovery and wanted_element_id is not None:
+                        unresolved_for_recovery.append((hk, last_block))
+                    else:
+                        last_block_by_hk[hk] = last_block
                 elif wanted_element_id is not None:
                     if backfill_hotkeys and hk not in backfill_hotkeys:
                         continue
                     unresolved_for_backfill.append((hk, list(arr)))
+
+            if wanted_element_id is not None and unresolved_for_recovery:
+                try:
+                    validator_indexes = await get_validator_indexes_from_chain(netuid)
+                    recovered = await recover_commitments_from_shards(
+                        {(hk, wanted_element_id) for hk, _block in unresolved_for_recovery},
+                        validator_indexes,
+                    )
+                    for hk, recovery_block in unresolved_for_recovery:
+                        recovered_commitment = recovered.get((hk, wanted_element_id))
+                        if recovered_commitment is None:
+                            logger.warning(
+                                "[first_commit_block_by_miner] recovery unresolved "
+                                "hotkey=%s element=%s recovery_block=%s",
+                                hk,
+                                wanted_element_id,
+                                recovery_block,
+                            )
+                            continue
+                        last_block_by_hk[hk] = recovered_commitment.commit_block
+                    logger.info(
+                        "[first_commit_block_by_miner] recovered %d/%d hotkey(s) "
+                        "for element=%s",
+                        sum(
+                            1
+                            for hk, _block in unresolved_for_recovery
+                            if hk in last_block_by_hk
+                        ),
+                        len(unresolved_for_recovery),
+                        wanted_element_id,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[first_commit_block_by_miner] shard recovery error: %s",
+                        e,
+                    )
 
             if (
                 wanted_element_id is not None
@@ -498,9 +589,9 @@ async def _first_commit_block_by_miner(
             ):
                 st_archive = None
                 try:
-                    from bittensor import async_subtensor
-
-                    st_archive = async_subtensor(_TIEBREAK_COMMIT_BACKFILL_ARCHIVE_ENDPOINT)
+                    st_archive = AsyncSubtensor(
+                        network=_TIEBREAK_COMMIT_BACKFILL_ARCHIVE_ENDPOINT
+                    )
                     await asyncio.wait_for(st_archive.initialize(), timeout=20.0)
                     sem = asyncio.Semaphore(_TIEBREAK_COMMIT_BACKFILL_CONCURRENCY)
 
@@ -645,10 +736,8 @@ async def on_chain_commit_validator_retry(
     max_retries: int | None = None,
 ) -> bool:
     """ """
-    from bittensor import wallet
-
     settings = get_settings()
-    w = wallet(
+    w = Wallet(
         name=settings.BITTENSOR_WALLET_COLD,
         hotkey=settings.BITTENSOR_WALLET_HOT,
     )

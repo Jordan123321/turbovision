@@ -5,15 +5,11 @@ import uuid
 from json import dumps, loads
 from logging import getLogger
 from pathlib import Path
-from time import time
+from time import perf_counter, time
 from urllib.parse import urljoin, urlparse
 import aiohttp
-try:
-    from async_substrate_interface.errors import SubstrateRequestException
-except ImportError:
-    class SubstrateRequestException(Exception):
-        pass
-
+from async_substrate_interface.errors import SubstrateRequestException
+from bittensor_wallet import Keypair
 from scorevision.utils.bittensor_helpers import get_subtensor, reset_subtensor
 from scorevision.utils.data_models import SVChallenge, SVEvaluation, SVRunOutput
 from scorevision.utils.prometheus import (
@@ -29,6 +25,7 @@ from scorevision.utils.r2 import (
     is_configured,
     is_not_found_error,
 )
+from scorevision.utils.inactive_miners import parse_inactive_miner_tuples
 from scorevision.utils.settings import get_settings
 from scorevision.utils.signing import _sign_batch
 
@@ -92,8 +89,6 @@ def _get_cache_dir():
 
 def _verify_signature(hk_ss58: str, payload: str, sig_hex: str) -> bool:
     try:
-        from substrateinterface import Keypair
-
         if not hk_ss58 or not sig_hex:
             return False
         sig_hex = sig_hex[2:] if sig_hex.startswith("0x") else sig_hex
@@ -120,6 +115,10 @@ def _winners_index_key(ns: str | None = None) -> str:
 
 def _lane_index_key(lane: str = "public") -> str:
     return "manako/indexprivate.json" if str(lane or "public").strip() == "private" else "manako/index.json"
+
+
+def _inactive_miners_key() -> str:
+    return "manako/inactive_miners.json"
 
 
 async def _index_list(*, index_key: str | None = None) -> list[str]:
@@ -220,13 +219,19 @@ def _r2_enabled() -> bool:
     return is_configured(central_r2_config(get_settings()), require_bucket=True)
 
 
-async def _index_add_if_new(key: str, *, index_key: str = "manako/index.json") -> None:
+async def _index_add_if_new(
+    key: str,
+    *,
+    index_key: str = "manako/index.json",
+    trace_id: str | None = None,
+) -> None:
     settings = get_settings()
     await add_index_key_if_new(
         client_factory=get_s3_client,
         bucket=settings.SCOREVISION_BUCKET,
         key=key,
         index_key=index_key,
+        trace_id=trace_id,
     )
 
 
@@ -275,6 +280,7 @@ async def sink_sv_at(
     lines: list[dict],
     *,
     lane: str = "public",
+    trace_id: str | None = None,
 ) -> tuple[str, list[dict]]:
     if not lines:
         return "", []
@@ -282,7 +288,17 @@ async def sink_sv_at(
         dumps(l.get("payload") or {}, sort_keys=True, separators=(",", ":"))
         for l in lines
     ]
+    sign_started = perf_counter()
+    if trace_id:
+        logger.info("[emit:%s] stage=sign status=start", trace_id)
     hk, sigs = await _sign_batch(payloads)
+    if trace_id:
+        logger.info(
+            "[emit:%s] stage=sign status=done duration_ms=%.1f payloads=%d",
+            trace_id,
+            (perf_counter() - sign_started) * 1000.0,
+            len(payloads),
+        )
     signed = []
     for base, sig in zip(lines, sigs):
         rec = dict(base)
@@ -291,16 +307,96 @@ async def sink_sv_at(
         signed.append(rec)
 
     s = get_settings()
+    shard_body = dumps(signed, separators=(",", ":"))
 
     async with get_s3_client() as c:
+        put_started = perf_counter()
+        if trace_id:
+            logger.info(
+                "[emit:%s] stage=shard_put status=start bytes=%d key=%s",
+                trace_id,
+                len(shard_body.encode()),
+                key,
+            )
         await c.put_object(
             Bucket=s.SCOREVISION_BUCKET,
             Key=key,
-            Body=dumps(signed, separators=(",", ":")),
+            Body=shard_body,
             ContentType="application/json",
         )
-        await _index_add_if_new(key, index_key=_lane_index_key(lane))
+        if trace_id:
+            logger.info(
+                "[emit:%s] stage=shard_put status=done duration_ms=%.1f bytes=%d",
+                trace_id,
+                (perf_counter() - put_started) * 1000.0,
+                len(shard_body.encode()),
+            )
+        await _index_add_if_new(
+            key,
+            index_key=_lane_index_key(lane),
+            trace_id=trace_id,
+        )
     return hk, signed
+
+
+async def _sink_sv_at_with_retries(
+    key: str,
+    lines: list[dict],
+    *,
+    lane: str,
+    timeout_s: float,
+    rid: str,
+    retries: int = 2,
+) -> tuple[str, list[dict]]:
+    """Write one score shard, retrying transient sink failures in isolation."""
+    for attempt in range(retries + 1):
+        attempt_started = perf_counter()
+        logger.info(
+            "[emit:%s] stage=sink_attempt status=start attempt=%d/%d timeout_s=%.1f",
+            rid,
+            attempt + 1,
+            retries + 1,
+            timeout_s,
+        )
+        try:
+            result = await asyncio.wait_for(
+                sink_sv_at(key, lines, lane=lane, trace_id=rid), timeout=timeout_s
+            )
+            logger.info(
+                "[emit:%s] stage=sink_attempt status=done attempt=%d/%d duration_ms=%.1f",
+                rid,
+                attempt + 1,
+                retries + 1,
+                (perf_counter() - attempt_started) * 1000.0,
+            )
+            return result
+        except Exception as exc:
+            duration_ms = (perf_counter() - attempt_started) * 1000.0
+            if attempt >= retries:
+                logger.error(
+                    "[emit:%s] stage=sink_attempt status=failed attempt=%d/%d "
+                    "duration_ms=%.1f error_type=%s error=%r",
+                    rid,
+                    attempt + 1,
+                    retries + 1,
+                    duration_ms,
+                    type(exc).__name__,
+                    exc,
+                )
+                raise
+            delay_s = 0.5 * (2**attempt)
+            logger.warning(
+                "[emit:%s] stage=sink_attempt status=retry attempt=%d/%d "
+                "duration_ms=%.1f error_type=%s error=%r retry_in_s=%.1f",
+                rid,
+                attempt + 1,
+                retries + 1,
+                duration_ms,
+                type(exc).__name__,
+                exc,
+                delay_s,
+            )
+            await asyncio.sleep(delay_s)
 
 
 async def emit_shard(
@@ -553,8 +649,12 @@ async def emit_shard(
 
     try:
         logger.info(f"[emit:{rid}] writing evaluation shard to {eval_key}")
-        hk, signed_lines = await asyncio.wait_for(
-            sink_sv_at(eval_key, [shard_line], lane=lane), timeout=timeout_s
+        hk, signed_lines = await _sink_sv_at_with_retries(
+            eval_key,
+            [shard_line],
+            lane=lane,
+            timeout_s=timeout_s,
+            rid=rid,
         )
     except asyncio.TimeoutError:
         logger.error(f"[emit:{rid}] sink_sv_at timed out after {timeout_s}s")
@@ -704,15 +804,44 @@ def _cache_path_for_url(url: str) -> Path:
     return _get_cache_dir() / f"{name}.{h}.jsonl"
 
 
+def _exception_summary(exc: BaseException) -> str:
+    msg = str(exc).strip()
+    if msg:
+        return f"{type(exc).__name__}: {msg}"
+    return type(exc).__name__
+
+
 async def _cache_remote_json_array(url: str, sem: asyncio.Semaphore) -> Path:
     out = _cache_path_for_url(url)
     mod = out.with_suffix(".modified")
     async with sem:
-        etag, lm = await _http_head_meta(url)
+        try:
+            etag, lm = await _http_head_meta(url)
+        except Exception as e:
+            if out.exists():
+                logger.warning(
+                    "[dataset-multi] cache metadata refresh failed url=%s err=%s -> using stale cache",
+                    url,
+                    _exception_summary(e),
+                )
+                VALIDATOR_DATASET_FETCH_ERRORS_TOTAL.labels(stage="cache_head_stale").inc()
+                return out
+            raise RuntimeError(f"HEAD metadata failed ({_exception_summary(e)})") from e
         tag = (etag or lm or "").strip()
         if out.exists() and mod.exists() and mod.read_text().strip() == tag:
             return out
-        arr = await _http_get_json(url)
+        try:
+            arr = await _http_get_json(url)
+        except Exception as e:
+            if out.exists():
+                logger.warning(
+                    "[dataset-multi] cache body refresh failed url=%s err=%s -> using stale cache",
+                    url,
+                    _exception_summary(e),
+                )
+                VALIDATOR_DATASET_FETCH_ERRORS_TOTAL.labels(stage="cache_get_stale").inc()
+                return out
+            raise RuntimeError(f"GET body failed ({_exception_summary(e)})") from e
         tmp = out.with_suffix(".tmp")
         with tmp.open("wb") as f:
             for line in arr if isinstance(arr, list) else []:
@@ -790,7 +919,22 @@ def _extract_element_miner_commit_tuple_from_key_or_url(
     return element_id, miner_hotkey, commit_block
 
 async def _list_keys_from_remote_index(index_url: str) -> list[str]:
-    idx = await _http_get_json(index_url)
+    for attempt in range(1, 4):
+        try:
+            idx = await _http_get_json(index_url)
+            break
+        except Exception as exc:
+            if attempt == 3:
+                raise
+            delay_s = 2 ** (attempt - 1)
+            logger.warning(
+                "[dataset-multi] index fetch retry url=%s attempt=%d/3 error=%s retry_in_s=%d",
+                index_url,
+                attempt,
+                _exception_summary(exc),
+                delay_s,
+            )
+            await asyncio.sleep(delay_s)
     keys: list[str] = []
     if isinstance(idx, list):
         keys = [_join_key_to_base(index_url, k) for k in idx if isinstance(k, str)]
@@ -826,7 +970,9 @@ async def dataset_sv_multi(
         try:
             keys = await _list_keys_from_remote_index(idx_url)
         except Exception as e:
-            logger.warning(f"[dataset-multi] index fetch failed {idx_url}: {e}")
+            logger.warning(
+                "[dataset-multi] index fetch failed %s: %s", idx_url, _exception_summary(e)
+            )
             VALIDATOR_DATASET_FETCH_ERRORS_TOTAL.labels(stage="index_fetch").inc()
             continue
         if wanted_seg:
@@ -901,7 +1047,11 @@ async def dataset_sv_multi(
                 )
                 next_i += 1
         except Exception as e:
-            logger.warning(f"[dataset-multi] cache failed {url}: {e}")
+            logger.warning(
+                "[dataset-multi] cache failed %s: %s",
+                url,
+                _exception_summary(e),
+            )
             VALIDATOR_DATASET_FETCH_ERRORS_TOTAL.labels(stage="cache_fetch").inc()
             continue
 
@@ -912,6 +1062,7 @@ async def dataset_sv_multi(
                 try:
                     line = _loads(raw.rstrip(b"\n"))
                     line["_src_index"] = iurl
+                    line["_key"] = url
                     payload_str = dumps(
                         line.get("payload") or {}, sort_keys=True, separators=(",", ":")
                     )
@@ -1028,4 +1179,38 @@ async def put_winners_snapshot(
             ContentType="application/json",
         )
     await _winners_index_add_if_new(index_key, key)
+    return key
+
+
+async def put_inactive_miners(inactive_miners: list[dict[str, str | int]]) -> str:
+    s = get_settings()
+    key = _inactive_miners_key()
+    async with get_s3_client() as c:
+        try:
+            response = await c.get_object(Bucket=s.SCOREVISION_BUCKET, Key=key)
+            existing = loads(await response["Body"].read())
+        except Exception as e:
+            if not is_not_found_error(e):
+                raise
+            existing = []
+
+        merged = parse_inactive_miner_tuples(existing)
+        merged.update(parse_inactive_miner_tuples(inactive_miners))
+        payload = [
+            {
+                "hotkey": item.hotkey,
+                "element_id": item.element_id,
+                "commit_block": item.commit_block,
+            }
+            for item in sorted(
+                merged,
+                key=lambda item: (item.hotkey, item.element_id, item.commit_block),
+            )
+        ]
+        await c.put_object(
+            Bucket=s.SCOREVISION_BUCKET,
+            Key=key,
+            Body=dumps(payload, separators=(",", ":")),
+            ContentType="application/json",
+        )
     return key

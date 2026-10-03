@@ -189,7 +189,7 @@ async def run_top_performer_benchmark(
         import bittensor as bt
 
         target_miner = await _resolve_private_target(selected_element_id, winner_entry)
-        wallet = bt.wallet(
+        wallet = bt.Wallet(
             name=settings.BITTENSOR_WALLET_COLD,
             hotkey=settings.BITTENSOR_WALLET_HOT,
         )

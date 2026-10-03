@@ -1,0 +1,535 @@
+import asyncio
+from types import SimpleNamespace
+
+import pytest
+
+from scorevision.validator.audit.open_source import compliance as compliance_mod
+from scorevision.validator.audit.open_source import security as security_mod
+from scorevision.utils.commit_recovery import RecoveredCommitment
+
+
+def test_security_runner_is_initialized_and_callable():
+    assert callable(compliance_mod._get_security_runner())
+
+
+def test_security_runner_falls_back_when_loader_fails(monkeypatch):
+    monkeypatch.setattr(compliance_mod, "_SECURITY_RUNNER", None)
+
+    def boom():
+        raise ImportError("missing dependency")
+
+    monkeypatch.setattr(compliance_mod, "_load_security_runner", boom)
+    fn = compliance_mod._get_security_runner()
+    out = fn(model_repo="a/b", revision="r1", payload_frames=[])
+    assert out.success is True
+    assert out.latency_ms == 0.0
+
+
+def test_p95_uses_sorted_index_percentile():
+    values = [10.0, 30.0, 20.0, 50.0, 40.0]
+    # index = int(0.95 * (n - 1)) = int(3.8) = 3 -> sorted[3] = 40
+    assert compliance_mod._p95(values) == 40.0
+
+
+def test_latency_threshold_uses_manifest_element_value():
+    manifest = SimpleNamespace(
+        elements=[
+            SimpleNamespace(id="PlayerDetect_v1@1.0", latency_p95_ms=250),
+        ]
+    )
+
+    threshold = compliance_mod._latency_threshold_ms_for_element(
+        manifest,
+        "PlayerDetect_v1@1.0",
+        fallback_ms=100.0,
+    )
+
+    assert threshold == 250.0
+
+
+def test_latency_threshold_falls_back_when_manifest_value_missing():
+    manifest = SimpleNamespace(
+        elements=[
+            SimpleNamespace(id="PlayerDetect_v1@1.0", latency_p95_ms=None),
+        ]
+    )
+
+    threshold = compliance_mod._latency_threshold_ms_for_element(
+        manifest,
+        "PlayerDetect_v1@1.0",
+        fallback_ms=100.0,
+    )
+
+    assert threshold == 100.0
+
+
+def test_targets_from_winners_uses_entry_winner_commit_block_fallback():
+    targets = compliance_mod._targets_from_winners(
+        {
+            "winners": {
+                "E1": {
+                    "winner_hotkey": "hk1",
+                    "winner_commit_block": 321,
+                    "top_3_official": [{"hotkey": "hk1", "avg_score": 1.0}],
+                    "top_3_watchlist": [],
+                }
+            }
+        }
+    )
+
+    assert targets[0]["commit_block"] == 321
+
+
+def test_targets_from_winners_includes_winner_outside_top_three():
+    targets = compliance_mod._targets_from_winners(
+        {
+            "winners": {
+                "E1": {
+                    "winner_hotkey": "tie-break-winner",
+                    "winner_commit_block": 444,
+                    "top_3_official": [
+                        {"hotkey": "average-1", "commit_block": 101},
+                        {"hotkey": "average-2", "commit_block": 102},
+                        {"hotkey": "average-3", "commit_block": 103},
+                    ],
+                    "top_3_watchlist": [],
+                }
+            }
+        }
+    )
+
+    by_hotkey = {target["hotkey"]: target for target in targets}
+    assert by_hotkey["tie-break-winner"]["commit_block"] == 444
+    assert set(by_hotkey) == {"average-1", "average-2", "average-3", "tie-break-winner"}
+
+
+def test_resolve_target_commit_skips_when_winner_commit_block_is_missing():
+    target = {"element_id": "E1", "hotkey": "hk1"}
+
+    resolved = asyncio.run(
+        compliance_mod._resolve_target_commit(
+            target,
+            commits_by_hotkey={
+                "hk1": [
+                    (
+                        200,
+                        '{"role":"miner","element_id":"E1","model":"repo/model","revision":"rev2"}',
+                    )
+                ]
+            },
+            hotkey_to_uid={"hk1": 1},
+        )
+    )
+
+    assert resolved["skip_reason"] == "winner_commit_block_missing"
+
+
+def test_resolve_target_commit_skips_when_current_commit_block_changed():
+    target = {"element_id": "E1", "hotkey": "hk1", "commit_block": 100}
+
+    resolved = asyncio.run(
+        compliance_mod._resolve_target_commit(
+            target,
+            commits_by_hotkey={
+                "hk1": [
+                    (
+                        200,
+                        '{"role":"miner","element_id":"E1","model":"repo/model","revision":"rev2"}',
+                    )
+                ]
+            },
+            hotkey_to_uid={"hk1": 1},
+        )
+    )
+
+    assert resolved["skip_reason"] == "new_commit_block"
+    assert resolved["commit_block"] == 100
+    assert resolved["current_commit_block"] == 200
+
+
+def test_resolve_target_commit_uses_chain_model_when_commit_block_matches():
+    target = {"element_id": "E1", "hotkey": "hk1", "commit_block": 200}
+
+    resolved = asyncio.run(
+        compliance_mod._resolve_target_commit(
+            target,
+            commits_by_hotkey={
+                "hk1": [
+                    (
+                        200,
+                        '{"role":"miner","element_id":"E1","model":"repo/model","revision":"rev2"}',
+                    )
+                ]
+            },
+            hotkey_to_uid={"hk1": 1},
+        )
+    )
+
+    assert resolved is not None
+    assert "skip_reason" not in resolved
+    assert resolved["commit_block"] == 200
+    assert resolved["model"] == "repo/model"
+    assert resolved["revision"] == "rev2"
+
+
+def test_resolve_target_commit_uses_recovered_original_commitment():
+    target = {"element_id": "E1", "hotkey": "hk1", "commit_block": 100}
+    recovered = RecoveredCommitment(
+        model="repo/model",
+        revision="rev1",
+        slug="slug1",
+        chute_id="chute1",
+        element_id="E1",
+        commit_block=100,
+        shard_block=499,
+        shard_key="shard.json",
+    )
+
+    resolved = asyncio.run(
+        compliance_mod._resolve_target_commit(
+            target,
+            commits_by_hotkey={
+                "hk1": [
+                    (
+                        500,
+                        '{"role":"miner_recover","element_id":"E1","hotkey":"hk1"}',
+                    )
+                ]
+            },
+            hotkey_to_uid={"hk1": 1},
+            recovered_commitments={("hk1", "E1"): recovered},
+        )
+    )
+
+    assert resolved is not None
+    assert "skip_reason" not in resolved
+    assert resolved["commit_block"] == 100
+    assert resolved["model"] == "repo/model"
+    assert resolved["revision"] == "rev1"
+
+
+@pytest.mark.asyncio
+async def test_recover_target_commitments_batches_recovery_requests(monkeypatch):
+    async def fake_validator_indexes(netuid):
+        assert netuid == 18
+        return {"validator": "https://validator.example/manako/index.json"}
+
+    recovered = RecoveredCommitment(
+        model="repo/model",
+        revision="rev1",
+        slug="slug1",
+        chute_id="chute1",
+        element_id="E1",
+        commit_block=100,
+        shard_block=499,
+        shard_key="shard.json",
+    )
+
+    async def fake_recover(requests, indexes):
+        assert requests == {("hk1", "E1")}
+        assert indexes == {"validator": "https://validator.example/manako/index.json"}
+        return {("hk1", "E1"): recovered}
+
+    monkeypatch.setattr(
+        compliance_mod,
+        "get_validator_indexes_from_chain",
+        fake_validator_indexes,
+    )
+    monkeypatch.setattr(
+        compliance_mod,
+        "recover_commitments_from_shards",
+        fake_recover,
+    )
+
+    result = await compliance_mod._recover_target_commitments(
+        [{"element_id": "E1", "hotkey": "hk1", "commit_block": 100}],
+        {
+            "hk1": [
+                (
+                    90,
+                    '{"role":"miner","element_id":"E1","model":"old","revision":"old"}',
+                ),
+                (
+                    500,
+                    '{"role":"miner_recover","element_id":"E1","hotkey":"hk1"}',
+                ),
+            ]
+        },
+        netuid=18,
+    )
+
+    assert result == {("hk1", "E1"): recovered}
+
+
+def test_compare_predictions_iou_success_when_boxes_match():
+    expected = {
+        "frames": [
+            {
+                "frame_id": 1,
+                "boxes": [
+                    {"cls_id": 0, "x1": 10, "y1": 10, "x2": 20, "y2": 20},
+                ],
+            }
+        ]
+    }
+    actual = {
+        "frames": [
+            {
+                "frame_id": 1,
+                "boxes": [
+                    {"cls_id": 0, "x1": 10, "y1": 10, "x2": 20, "y2": 20},
+                ],
+            }
+        ]
+    }
+
+    ok, info = compliance_mod._compare_predictions_iou(expected, actual, threshold=0.9)
+
+    assert ok is True
+    assert info["mean_iou"] == 1.0
+    assert info["frames_compared"] == 1
+    assert info["extra_boxes"] == 0
+    assert info["missing_boxes"] == 0
+    assert info["expected_detections"] == 1
+    assert info["actual_detections"] == 1
+    assert info["matched_detections"] == 1
+    assert info["matched_mean_iou"] == 1.0
+
+
+def test_compare_predictions_iou_success_when_polygons_match():
+    expected = {
+        "frames": [
+            {
+                "frame_id": 1,
+                "polygons": [
+                    {
+                        "cls_id": 0,
+                        "points": [(10, 10), (20, 10), (20, 20), (10, 20)],
+                    },
+                ],
+            }
+        ]
+    }
+    actual = {
+        "frames": [
+            {
+                "frame_id": 1,
+                "polygons": [
+                    {
+                        "cls_id": 0,
+                        "points": [(10, 10), (20, 10), (20, 20), (10, 20)],
+                    },
+                ],
+            }
+        ]
+    }
+
+    ok, info = compliance_mod._compare_predictions_iou(expected, actual, threshold=0.9)
+
+    assert ok is True
+    assert info["mean_iou"] == 1.0
+    assert info["extra_detections"] == 0
+    assert info["missing_detections"] == 0
+
+
+def test_compare_predictions_iou_accepts_box_against_polygon():
+    expected = {
+        "frames": [
+            {
+                "frame_id": 1,
+                "boxes": [
+                    {"cls_id": 0, "x1": 10, "y1": 10, "x2": 20, "y2": 20},
+                ],
+            }
+        ]
+    }
+    actual = {
+        "frames": [
+            {
+                "frame_id": 1,
+                "polygons": [
+                    {
+                        "cls_id": 0,
+                        "points": [(10, 10), (20, 10), (20, 20), (10, 20)],
+                    },
+                ],
+            }
+        ]
+    }
+
+    ok, info = compliance_mod._compare_predictions_iou(expected, actual, threshold=0.9)
+
+    assert ok is True
+    assert info["mean_iou"] == 1.0
+
+
+def test_compare_predictions_iou_reports_soft_drift_metrics_for_one_missing_box():
+    expected = {
+        "frames": [
+            {
+                "frame_id": 1,
+                "boxes": [
+                    {"cls_id": 0, "x1": 10, "y1": 10, "x2": 20, "y2": 20},
+                    {"cls_id": 0, "x1": 40, "y1": 40, "x2": 50, "y2": 50},
+                ],
+            }
+        ]
+    }
+    actual = {
+        "frames": [
+            {
+                "frame_id": 1,
+                "boxes": [
+                    {"cls_id": 0, "x1": 10, "y1": 10, "x2": 20, "y2": 20},
+                ],
+            }
+        ]
+    }
+
+    ok, info = compliance_mod._compare_predictions_iou(expected, actual, threshold=0.9)
+
+    assert ok is False
+    assert info["mean_iou"] == 0.5
+    assert info["matched_mean_iou"] == 1.0
+    assert info["expected_detections"] == 2
+    assert info["actual_detections"] == 1
+    assert info["matched_detections"] == 1
+    assert info["missing_boxes"] == 1
+    assert info["extra_boxes"] == 0
+    assert info["missing_ratio"] == 0.5
+
+
+def test_is_soft_output_drift_accepts_small_count_delta_with_strong_matches():
+    settings = SimpleNamespace(
+        CHECKER_OUTPUT_DRIFT_MAX_MISSING=1,
+        CHECKER_OUTPUT_DRIFT_MAX_EXTRA=1,
+        CHECKER_OUTPUT_DRIFT_MIN_MATCHED_IOU=0.95,
+    )
+    info = {
+        "missing_boxes": 1,
+        "extra_boxes": 0,
+        "matched_detections": 3,
+        "matched_mean_iou": 0.98,
+    }
+
+    assert compliance_mod._is_soft_output_drift(info, settings) is True
+
+
+def test_is_soft_output_drift_rejects_weak_matches_or_no_matches():
+    settings = SimpleNamespace(
+        CHECKER_OUTPUT_DRIFT_MAX_MISSING=1,
+        CHECKER_OUTPUT_DRIFT_MAX_EXTRA=1,
+        CHECKER_OUTPUT_DRIFT_MIN_MATCHED_IOU=0.95,
+    )
+
+    assert (
+        compliance_mod._is_soft_output_drift(
+            {
+                "missing_boxes": 1,
+                "extra_boxes": 0,
+                "matched_detections": 3,
+                "matched_mean_iou": 0.80,
+            },
+            settings,
+        )
+        is False
+    )
+    assert (
+        compliance_mod._is_soft_output_drift(
+            {
+                "missing_boxes": 1,
+                "extra_boxes": 0,
+                "matched_detections": 0,
+                "matched_mean_iou": 1.0,
+            },
+            settings,
+        )
+        is False
+    )
+
+
+def test_security_output_validation_accepts_polygon_only_frames():
+    security_mod._validate_prediction_output(
+        [
+            {
+                "frame_id": 1,
+                "polygons": [
+                    {
+                        "cls_id": 0,
+                        "points": [(10, 10), (20, 10), (20, 20), (10, 20)],
+                    }
+                ],
+            }
+        ]
+    )
+
+
+def test_compare_predictions_iou_fails_without_common_frames():
+    expected = {"frames": [{"frame_id": 1, "boxes": []}]}
+    actual = {"frames": [{"frame_id": 2, "boxes": []}]}
+
+    ok, info = compliance_mod._compare_predictions_iou(expected, actual, threshold=0.5)
+
+    assert ok is False
+    assert info["reason"] == "no_common_frames"
+
+
+def test_run_public_compliance_once_fails_when_checker_r2_unconfigured(monkeypatch):
+    monkeypatch.setattr(compliance_mod, "checker_r2_config", lambda: object())
+    monkeypatch.setattr(compliance_mod, "is_configured", lambda _cfg, require_bucket=True: False)
+
+    with pytest.raises(RuntimeError, match="Checker R2 not configured"):
+        asyncio.run(compliance_mod.run_public_compliance_once())
+
+
+def test_compliance_loop_triggers_run_when_interval_elapsed(monkeypatch):
+    calls = {"run": 0, "sleep": 0}
+
+    class FakeSubtensor:
+        async def get_current_block(self):
+            return 100
+
+    async def fake_get_subtensor():
+        return FakeSubtensor()
+
+    async def fake_run_once():
+        calls["run"] += 1
+        return {"winners_block": 99, "targets": 3}
+
+    async def fake_load_last_trigger_block():
+        return 0
+
+    async def fake_sleep(_seconds):
+        calls["sleep"] += 1
+        raise asyncio.CancelledError()
+
+    settings = SimpleNamespace(
+        CHECKER_INTERVAL_BLOCKS=10,
+        CHECKER_POLL_INTERVAL_S=0,
+    )
+
+    monkeypatch.setattr(compliance_mod, "get_settings", lambda: settings)
+    monkeypatch.setattr(compliance_mod, "get_subtensor", fake_get_subtensor)
+    monkeypatch.setattr(compliance_mod, "run_public_compliance_once", fake_run_once)
+    monkeypatch.setattr(compliance_mod, "_load_last_trigger_block_from_runs_index", fake_load_last_trigger_block)
+    monkeypatch.setattr(compliance_mod.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(compliance_mod.compliance_loop())
+
+    assert calls["run"] == 1
+    assert calls["sleep"] == 1
+
+
+def test_latency_percentile_ignores_the_two_slowest_of_ten():
+    """One unlucky inference should not decide a miner's verdict."""
+    latencies = [80.0, 82.0, 84.0, 86.0, 88.0, 90.0, 92.0, 95.0, 200.0, 250.0]
+
+    assert compliance_mod._p95(latencies) == 95.0  # p80: the 8th of ten
+    assert compliance_mod.LATENCY_PERCENTILE == 0.80
+
+
+def test_latency_percentile_handles_short_and_empty_samples():
+    assert compliance_mod._p95([]) == 0.0
+    assert compliance_mod._p95([100.0]) == 100.0
+    assert compliance_mod._p95([100.0, 200.0]) == 100.0

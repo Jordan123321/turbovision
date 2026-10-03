@@ -1,4 +1,7 @@
 from pathlib import Path
+
+import cv2
+
 from scorevision.miner.private_track.video import get_frame_count
 from scorevision.utils.schemas import (
     ChallengeRequest,
@@ -7,6 +10,7 @@ from scorevision.utils.schemas import (
     SnookerBallPrediction,
     SnookerBallStateFrame,
     SnookerBallStatePrediction,
+    TCGGradingPrediction,
 )
 
 
@@ -74,4 +78,23 @@ def predict_snooker_ball_state(request: ChallengeRequest) -> SnookerBallStatePre
                 ],
             )
         ]
+    )
+
+
+def predict_tcg_grading(image_path: Path) -> TCGGradingPrediction:
+    """Validate the downloaded card image and run TCG grading inference."""
+    image = cv2.imread(str(image_path))
+    if image is None:
+        raise ValueError(f"Cannot open card image: {image_path}")
+
+    # TODO: Replace these neutral grades with model inference using both halves
+    # of the combined front/back image.
+    return TCGGradingPrediction(
+        Header={"card_grade": 5},
+        Grading_Features={
+            "subgrade_surface": 5,
+            "subgrade_centering": 5,
+            "subgrade_edges": 5,
+            "subgrade_corners": 5,
+        },
     )

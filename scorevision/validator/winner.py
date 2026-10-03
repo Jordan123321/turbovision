@@ -8,6 +8,10 @@ from scorevision.utils.bittensor_helpers import (
     get_validator_indexes_from_chain,
 )
 from scorevision.utils.cloudflare_helpers import dataset_sv, dataset_sv_multi
+from scorevision.utils.compliance_failures import (
+    ComplianceFailureTuple,
+    is_compliance_tuple_failed,
+)
 from scorevision.utils.prometheus import (
     CURRENT_WINNER,
     VALIDATOR_MINERS_CONSIDERED,
@@ -15,6 +19,7 @@ from scorevision.utils.prometheus import (
     VALIDATOR_WINNER_SCORE,
 )
 from scorevision.utils.settings import get_settings
+from scorevision.utils.r2_public import extract_element_miner_commit_from_key
 from scorevision.validator.models import OpenSourceMinerMeta
 from scorevision.validator.payload import (
     build_winner_meta,
@@ -23,11 +28,138 @@ from scorevision.validator.payload import (
     extract_miner_meta,
 )
 from scorevision.validator.scoring import (
-    aggregate_challenge_scores_by_miner,
+    aggregate_challenge_score_batches_by_miner,
+    days_to_blocks,
     pick_winner_with_tiebreak,
 )
 
 logger = getLogger(__name__)
+
+
+def _drop_initial_zero_scores(scores: list[float], *, max_dropped: int = 5) -> tuple[list[float], int]:
+    dropped = 0
+    for score in scores:
+        if dropped >= max(0, int(max_dropped)):
+            break
+        if abs(float(score or 0.0)) <= 1e-12:
+            dropped += 1
+            continue
+        break
+    if dropped <= 0:
+        return list(scores), 0
+    return list(scores[dropped:]), dropped
+
+
+def _drop_initial_zero_challenge_rows(
+    rows: list[tuple[str, float]],
+    *,
+    max_dropped: int = 5,
+) -> tuple[list[tuple[str, float]], int]:
+    """Drop only the leading zero-score challenge rows, preserving their IDs."""
+    _filtered_scores, dropped = _drop_initial_zero_scores(
+        [float(score) for _challenge_id, score in rows],
+        max_dropped=max_dropped,
+    )
+    return list(rows[dropped:]), dropped
+
+
+def _apply_recent_commit_initial_zero_challenge_filter(
+    *,
+    challenge_scores_by_validator_miner: dict[tuple[str, int], deque],
+    uid_to_hk: dict[int, str],
+    first_commit_block_by_hk: dict[str, int],
+    max_block: int | None,
+    recent_commit_blocks: int,
+) -> tuple[dict[tuple[str, int], deque], int]:
+    """Apply the score warm-up filter to ordered tie-break challenge rows."""
+    filtered: dict[tuple[str, int], deque] = {}
+    dropped_total = 0
+
+    for challenge_key, challenge_rows in challenge_scores_by_validator_miner.items():
+        _validator_hk, miner_uid = challenge_key
+        miner_hk = uid_to_hk.get(miner_uid, "")
+        commit_block = first_commit_block_by_hk.get(miner_hk) if miner_hk else None
+        should_filter = (
+            max_block is not None
+            and commit_block is not None
+            and int(max_block) - int(commit_block) <= int(recent_commit_blocks)
+        )
+
+        rows = list(challenge_rows)
+        if should_filter:
+            rows, dropped = _drop_initial_zero_challenge_rows(rows)
+            dropped_total += dropped
+        filtered[challenge_key] = deque(rows, maxlen=challenge_rows.maxlen)
+
+    return filtered, dropped_total
+
+
+def _extract_sample_block(line: dict, payload: dict, telemetry: dict) -> int | None:
+    for block_value in (payload.get("block"), telemetry.get("block"), line.get("block")):
+        if block_value is None:
+            continue
+        try:
+            return int(block_value)
+        except Exception:
+            continue
+    return None
+
+
+def _extract_sample_commit_block(line: dict) -> int | None:
+    for key_name in ("_key", "key", "path", "url"):
+        key = line.get(key_name)
+        if not key:
+            continue
+        try:
+            _element, _miner, commit_block = extract_element_miner_commit_from_key(str(key))
+        except Exception:
+            continue
+        if commit_block >= 0:
+            return int(commit_block)
+    return None
+
+
+def _select_representative_commit_block(commit_counts: Counter[int]) -> int | None:
+    if not commit_counts:
+        return None
+    return max(commit_counts.items(), key=lambda item: (int(item[1]), int(item[0])))[0]
+
+
+def _apply_recent_commit_initial_zero_filter(
+    *,
+    samples_by_uid: dict[int, list[tuple[int, float]]],
+    uid_to_hk: dict[int, str],
+    first_commit_block_by_hk: dict[str, int],
+    max_block: int | None,
+    recent_commit_blocks: int,
+    enabled: bool = True,
+) -> tuple[dict[int, list[float]], dict[int, int]]:
+    filtered_scores_by_uid: dict[int, list[float]] = {}
+    dropped_zero_prefix_by_uid: dict[int, int] = {}
+
+    for uid, samples in samples_by_uid.items():
+        ordered_samples = sorted(samples, key=lambda sample: int(sample[0]))
+        ordered_scores = [float(score) for (_block, score) in ordered_samples]
+        hk = uid_to_hk.get(uid, "")
+        commit_block = first_commit_block_by_hk.get(hk) if hk else None
+
+        should_filter = (
+            enabled
+            and max_block is not None
+            and commit_block is not None
+            and int(max_block) - int(commit_block) <= int(recent_commit_blocks)
+        )
+
+        if not should_filter or not ordered_scores:
+            filtered_scores_by_uid[uid] = ordered_scores
+            dropped_zero_prefix_by_uid[uid] = 0
+            continue
+
+        filtered_scores, dropped = _drop_initial_zero_scores(ordered_scores)
+        filtered_scores_by_uid[uid] = filtered_scores
+        dropped_zero_prefix_by_uid[uid] = dropped
+
+    return filtered_scores_by_uid, dropped_zero_prefix_by_uid
 
 
 def compute_adaptive_delta_rel(
@@ -57,6 +189,7 @@ async def get_local_fallback_winner_for_element(
     m_min: int,
     hk_to_uid: dict[str, int],
     lane: str = "public",
+    compliance_failure_tuples: set[ComplianceFailureTuple] | None = None,
 ) -> tuple[int | None, dict[int, float], dict[str, str | None] | None]:
     settings = get_settings()
     fallback_uid = settings.VALIDATOR_FALLBACK_UID
@@ -74,6 +207,17 @@ async def get_local_fallback_winner_for_element(
                 continue
             miner_uid, score = extract_miner_and_score(payload, hk_to_uid)
             if miner_uid is None:
+                continue
+            telemetry = payload.get("telemetry") or {}
+            miner_info = telemetry.get("miner") or {}
+            miner_hk = (miner_info.get("hotkey") or "").strip()
+            commit_block = _extract_sample_commit_block(line)
+            if is_compliance_tuple_failed(
+                compliance_failure_tuples,
+                hotkey=miner_hk,
+                element_id=element_id,
+                commit_block=commit_block,
+            ):
                 continue
             miner_meta = extract_miner_meta(payload)
             if miner_meta:
@@ -129,15 +273,27 @@ async def collect_recent_challenge_scores_by_validator_miner(
     element_id: str,
     current_window_id: str,
     lane: str = "public",
-    K: int = 25,
+    K: int | None = 25,
     eligible_uids: set[int] | None = None,
     excluded_uids: set[int] | None = None,
+    compliance_failure_tuples: set[ComplianceFailureTuple] | None = None,
 ) -> dict[tuple[str, int], deque]:
     challenge_scores: dict[tuple[str, int], deque] = defaultdict(lambda: deque(maxlen=K))
     async for line in dataset_sv_multi(tail, validator_indexes, element_id=element_id, lane=lane):
         try:
             payload = line.get("payload") or {}
             if payload.get("element_id") != element_id:
+                continue
+            telemetry = payload.get("telemetry") or {}
+            miner_info = telemetry.get("miner") or {}
+            miner_hk = (miner_info.get("hotkey") or "").strip()
+            commit_block = _extract_sample_commit_block(line)
+            if is_compliance_tuple_failed(
+                compliance_failure_tuples,
+                hotkey=miner_hk,
+                element_id=element_id,
+                commit_block=commit_block,
+            ):
                 continue
             miner_uid, score = extract_miner_and_score(payload, hk_to_uid)
             if miner_uid is None:
@@ -170,6 +326,7 @@ async def get_winner_for_element(
     blacklisted_hotkeys: set[str] | None = None,
     validator_hotkey_ss58: str | None = None,
     lane: str = "public",
+    compliance_failure_tuples: set[ComplianceFailureTuple] | None = None,
 ) -> tuple[
     int | None,
     dict[int, float],
@@ -181,6 +338,7 @@ async def get_winner_for_element(
     netuid = settings.SCOREVISION_NETUID
     mechid = settings.SCOREVISION_MECHID
     fallback_uid = settings.VALIDATOR_FALLBACK_UID
+    normalized_lane = str(lane or "public").strip() or "public"
 
     meta = await subtensor.metagraph(netuid, mechid=mechid)
     if blacklisted_hotkeys is None:
@@ -201,15 +359,20 @@ async def get_winner_for_element(
             m_min=m_min,
             hk_to_uid=hk_to_uid,
             lane=lane,
+            compliance_failure_tuples=compliance_failure_tuples,
         )
         return winner_uid, scores_by_uid, winner_meta, []
 
     sums_by_miner: dict[int, float] = {}
     cnt_by_miner: dict[int, int] = {}
+    samples_by_miner: dict[int, list[tuple[int, float]]] = defaultdict(list)
     miner_meta_by_hk: dict[str, OpenSourceMinerMeta] = {}
     diagnostics = Counter()
     unknown_miner_hotkeys: set[str] = set()
+    compliance_failed_hotkeys: set[str] = set()
     source_indexes: set[str] = set()
+    max_observed_block: int | None = None
+    commit_blocks_by_uid: dict[int, Counter[int]] = defaultdict(Counter)
 
     async for line in dataset_sv_multi(tail, validator_indexes, element_id=element_id, lane=lane):
         diagnostics["lines_total"] += 1
@@ -231,6 +394,16 @@ async def get_winner_for_element(
             if not miner_hk:
                 diagnostics["skip_missing_miner_hotkey"] += 1
                 continue
+            commit_block = _extract_sample_commit_block(line)
+            if is_compliance_tuple_failed(
+                compliance_failure_tuples,
+                hotkey=miner_hk,
+                element_id=element_id,
+                commit_block=commit_block,
+            ):
+                diagnostics["skip_compliance_failed_tuple"] += 1
+                compliance_failed_hotkeys.add(miner_hk)
+                continue
             if miner_hk not in hk_to_uid:
                 diagnostics["skip_unknown_miner_hotkey"] += 1
                 if len(unknown_miner_hotkeys) < 5:
@@ -243,12 +416,64 @@ async def get_winner_for_element(
             miner_meta = extract_miner_meta(payload)
             if miner_meta:
                 miner_meta_by_hk[miner_meta.hotkey] = miner_meta
+            block_int = _extract_sample_block(line, payload, telemetry)
         except Exception:
             diagnostics["skip_parse_error"] += 1
             continue
         diagnostics["accepted_lines"] += 1
-        sums_by_miner[miner_uid] = sums_by_miner.get(miner_uid, 0.0) + score
-        cnt_by_miner[miner_uid] = cnt_by_miner.get(miner_uid, 0) + 1
+        samples_by_miner[miner_uid].append((block_int or 0, float(score)))
+        if commit_block is not None:
+            commit_blocks_by_uid[miner_uid][int(commit_block)] += 1
+        if block_int is not None and (max_observed_block is None or block_int > max_observed_block):
+            max_observed_block = block_int
+
+    if compliance_failure_tuples or diagnostics["skip_compliance_failed_tuple"]:
+        logger.info(
+            "[winner:compliance] element_id=%s window_id=%s loaded_failing_tuples=%d "
+            "skipped_samples=%d skipped_hotkeys=%d",
+            element_id,
+            current_window_id,
+            len(compliance_failure_tuples or ()),
+            diagnostics["skip_compliance_failed_tuple"],
+            len(compliance_failed_hotkeys),
+        )
+
+    first_commit_block_by_hk = await _first_commit_block_by_miner(
+        netuid,
+        element_id=element_id,
+        candidate_hotkeys={uid_to_hk[uid] for uid in samples_by_miner.keys() if uid in uid_to_hk},
+        first_block=first_block,
+    )
+    recent_commit_blocks = days_to_blocks(3) or 0
+    initial_zero_filter_enabled = normalized_lane != "private"
+    filtered_scores_by_uid, dropped_zero_prefix_by_uid = _apply_recent_commit_initial_zero_filter(
+        samples_by_uid=samples_by_miner,
+        uid_to_hk=uid_to_hk,
+        first_commit_block_by_hk=first_commit_block_by_hk,
+        max_block=max_observed_block,
+        recent_commit_blocks=recent_commit_blocks,
+        enabled=initial_zero_filter_enabled,
+    )
+
+    dropped_total = 0
+    for uid, scores in filtered_scores_by_uid.items():
+        dropped = int(dropped_zero_prefix_by_uid.get(uid, 0))
+        dropped_total += dropped
+        if not scores:
+            continue
+        sums_by_miner[uid] = sum(scores)
+        cnt_by_miner[uid] = len(scores)
+    if dropped_total > 0:
+        logger.info(
+            "[weights:warmup-filter] element_id=%s dropped_initial_zero_scores=%d miners_affected=%d recent_window_blocks=%d max_observed_block=%s",
+            element_id,
+            dropped_total,
+            sum(1 for v in dropped_zero_prefix_by_uid.values() if int(v) > 0),
+            recent_commit_blocks,
+            max_observed_block,
+        )
+    elif not initial_zero_filter_enabled:
+        logger.info("[weights:warmup-filter] element_id=%s disabled for private lane", element_id)
 
     if not cnt_by_miner:
         logger.warning(
@@ -289,14 +514,16 @@ async def get_winner_for_element(
         hk = uid_to_hk.get(uid)
         if not hk:
             continue
-        sample_rows_all.append(
-            {
-                "hotkey": hk,
-                "uid": int(uid),
-                "avg_score": float(sums_by_miner[uid] / n),
-                "n_challenges": int(n),
-            }
-        )
+        row = {
+            "hotkey": hk,
+            "uid": int(uid),
+            "avg_score": float(sums_by_miner[uid] / n),
+            "n_challenges": int(n),
+        }
+        commit_block = _select_representative_commit_block(commit_blocks_by_uid.get(uid, Counter()))
+        if commit_block is not None:
+            row["commit_block"] = int(commit_block)
+        sample_rows_all.append(row)
 
     elig = [uid for uid, n in cnt_by_miner.items() if n >= m_min and uid in sums_by_miner]
     if not elig:
@@ -361,7 +588,7 @@ async def get_winner_for_element(
     )
 
     winner_from_tiebreak_only_pool = False
-    tiebreak_enabled_for_lane = settings.SCOREVISION_WINDOW_TIEBREAK_ENABLE and lane != "private"
+    tiebreak_enabled_for_lane = settings.SCOREVISION_WINDOW_TIEBREAK_ENABLE and normalized_lane != "private"
     if tiebreak_enabled_for_lane:
         try:
             adaptive_delta_rel = compute_adaptive_delta_rel(
@@ -397,6 +624,7 @@ async def get_winner_for_element(
             if validator_uid is not None:
                 excluded_uids_for_tiebreak.add(validator_uid)
 
+            challenge_batch_size = settings.SCOREVISION_WINDOW_K_PER_VALIDATOR
             challenge_scores_by_validator_miner = await collect_recent_challenge_scores_by_validator_miner(
                 tail=tail,
                 validator_indexes=validator_indexes,
@@ -404,14 +632,42 @@ async def get_winner_for_element(
                 element_id=element_id,
                 current_window_id=current_window_id,
                 lane=lane,
-                K=settings.SCOREVISION_WINDOW_K_PER_VALIDATOR,
+                K=None,
                 eligible_uids=None,
                 excluded_uids=excluded_uids_for_tiebreak,
+                compliance_failure_tuples=compliance_failure_tuples,
             )
-            challenge_scores_by_miner = aggregate_challenge_scores_by_miner(challenge_scores_by_validator_miner)
+            (
+                challenge_scores_by_validator_miner,
+                tiebreak_warmup_zeros_dropped,
+            ) = _apply_recent_commit_initial_zero_challenge_filter(
+                challenge_scores_by_validator_miner=challenge_scores_by_validator_miner,
+                uid_to_hk=uid_to_hk,
+                first_commit_block_by_hk=first_commit_block_by_hk,
+                max_block=max_observed_block,
+                recent_commit_blocks=recent_commit_blocks,
+            )
+            if tiebreak_warmup_zeros_dropped:
+                logger.info(
+                    "[window-tiebreak] Element=%s | Dropped %d initial zero-score challenge rows",
+                    element_id,
+                    tiebreak_warmup_zeros_dropped,
+                )
+            (
+                recent_challenge_scores_by_miner,
+                historical_challenge_scores_by_miner,
+            ) = aggregate_challenge_score_batches_by_miner(
+                challenge_scores_by_validator_miner,
+                batch_size=challenge_batch_size,
+            )
 
             additional_tiebreak_uids = {
-                uid for uid in challenge_scores_by_miner.keys() if uid not in excluded_uids_for_tiebreak
+                uid
+                for uid in (
+                    recent_challenge_scores_by_miner.keys()
+                    | historical_challenge_scores_by_miner.keys()
+                )
+                if uid not in excluded_uids_for_tiebreak
             }
             if additional_tiebreak_uids:
                 candidate_uids.update(additional_tiebreak_uids)
@@ -424,13 +680,13 @@ async def get_winner_for_element(
                     len(tiebreak_only_uids),
                 )
 
-            first_commit_block_by_hk = await _first_commit_block_by_miner(
+            first_commit_block_by_hk_tiebreak = await _first_commit_block_by_miner(
                 netuid,
                 element_id=element_id,
                 candidate_hotkeys={uid_to_hk[uid] for uid in candidate_uids if uid in uid_to_hk},
                 backfill_allowed_hotkeys={
                     uid_to_hk[uid]
-                    for uid in challenge_scores_by_miner.keys()
+                    for uid in recent_challenge_scores_by_miner.keys()
                     if uid in uid_to_hk
                 },
                 first_block=first_block,
@@ -438,12 +694,15 @@ async def get_winner_for_element(
             final_uid = pick_winner_with_tiebreak(
                 winner_uid,
                 uid_to_hk=uid_to_hk,
-                challenge_scores_by_miner=challenge_scores_by_miner,
+                recent_challenge_scores_by_miner=recent_challenge_scores_by_miner,
+                historical_challenge_scores_by_miner=historical_challenge_scores_by_miner,
+                current_window_id=current_window_id,
+                historical_sample_size=challenge_batch_size,
                 candidate_uids=candidate_uids,
                 delta_abs=settings.SCOREVISION_WINDOW_DELTA_ABS,
                 delta_rel=adaptive_delta_rel,
-                first_commit_block_by_hk=first_commit_block_by_hk,
-                min_common_challenges=6,
+                first_commit_block_by_hk=first_commit_block_by_hk_tiebreak,
+                min_common_challenges=8,
             )
             if final_uid != winner_uid:
                 logger.info(
@@ -456,7 +715,7 @@ async def get_winner_for_element(
             winner_from_tiebreak_only_pool = winner_uid in tiebreak_only_uids
         except Exception as e:
             logger.warning("[window-tiebreak] Element=%s disabled due to error: %s", element_id, e)
-    elif lane == "private" and settings.SCOREVISION_WINDOW_TIEBREAK_ENABLE:
+    elif normalized_lane == "private" and settings.SCOREVISION_WINDOW_TIEBREAK_ENABLE:
         logger.info("[window-tiebreak] Element=%s disabled for private lane", element_id)
 
     logger.info(

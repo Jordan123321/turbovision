@@ -9,6 +9,7 @@ from functools import lru_cache
 from logging import getLogger
 from pathlib import Path
 import aiohttp
+import bittensor as bt
 from scorevision.utils.settings import get_settings
 from scorevision.utils.windows import get_current_window_id
 from scorevision.utils.prometheus import (
@@ -33,10 +34,12 @@ from scorevision.utils.bittensor_helpers import (
     _already_committed_same_index,
 )
 from scorevision.utils.blacklist import BlacklistAPI, fetch_blacklisted_hotkeys
+from scorevision.utils.compliance_failures import fetch_compliance_failure_tuples
 from scorevision.utils.cloudflare_helpers import (
     ensure_index_exists,
     build_public_index_url_from_public_base,
     prune_sv,
+    put_inactive_miners,
     put_winners_snapshot,
 )
 from scorevision.utils.manifest import (
@@ -51,6 +54,10 @@ from scorevision.validator.winner import get_winner_for_element
 logger = getLogger(__name__)
 shutdown_event = asyncio.Event()
 
+PRIVATE_TRACK_RANKED_WEIGHT_SHARES = (0.80, 0.15, 0.05)
+PUBLIC_INACTIVE_MIN_SHARDS = 30
+PRIVATE_INACTIVE_MIN_SHARDS = 20
+
 HARDCODED_BLACKLIST_HOTKEYS: set[str] = {
     "5DvY7cxtAvUeA2Goq26LNyzqSfPyjfY9SUsD4bgJa5PMnVNa",
     "5CMaFwgm2rPka66iUcgAa2SpBPskk6KqAGWZeKVx8APLnqTZ",
@@ -63,22 +70,144 @@ HARDCODED_BLACKLIST_HOTKEYS: set[str] = {
     "5FZiTikQum61QyzWaaGmsiKmH1eX2jLcZ61V2E2WBg1QAAYV",
     "5C81gi3bXLbAWccH6VFY5T7BNhv9usEMdtwxHUVqeFPJ3zy9",
     "5Gj9pWjksQXkuaoVxHRaKN1pmgQYiUddrNweY3SFBWMGo2QD",
+    "5FkPaJTKgBr3rXX1YUt952ejVnwui4RZHoafBoR6txGkrSc3",
+    "5GYVPC5tTnHEtqZ4qVCHfyRFmQ1SDHHo9nwECphftrN8wbRG",
+    "5FkF684znSsYy1bjsaTDYpZDYN983Z5kavsvv6bNYyuNZQHy",
+    "5GNvBDx7qBcUUM3EwLTD2a5qVyFcjKs7Nf2zk2qxL1xPsXCw",
+    "5DvuNyrQQuDmzBMUDVNsRJSXBMxuBKAuKiJQUiTMAgTJoDoF",
+    "5HeKKwL1jyZnKUxSxLjVGxkioHCV2bCci6eEN1Qdd81APg4a",
+    "5GE4vXbuK7Q53AgSmwdPGrRrzUmjM4415K9JsbugS2JmcMgG",
+    "5F1mgNNNzFBjmGnq1i5SP6svoSxq2n9wp4WhA2DG9ttUKwD8",
+    "5DjwjwAhLGnuLYXFMtP5VuCeLiczEQmctiW1FMgBDkHKzhCf",
+    "5HddqPvyeF1E5FYZTiyaKQA85mprWfoP6d3GriXvks8vJXUG",
+    "5CVBjijH1eey2KobTcQJNBSBAFX5PtvdnqXKLZWswddvphMs",
+    "5CcLYznNrKLATjs3aV8USd58wCtD6keQYqmRTrtChBGU8T8C",
+    "5DUY4UEpn8EGewfezEKwFo4SfRn11mv6f1N2U8nw1LuMkA9q",
+    "5GiwVmxPXh35sWtGJTjE8YKpRy1dc9MvM1VPrgtPMpmmEoxz",
+    "5EjVevWZ8RD7ks8BX4YXXpJxSCasbSYitKHrQ1CqhQGp6JZu",
+    "5Ec6P4FZZqDHGfrD2iqa3kFAR83rqsPJRHSJtkmrcdwjBYkZ",
+    "5DhGGmDn7RrEjexDjSsRT5qWUMurt74esHqWKNyk8sYsaHQb",
+    "5CPKYUx11qM4CLJPu6UDMutEvB7VT4QA1BxhoEh5t27DvEBQ",
+    "5C4w41JTTSC3W7UPWmeppKDGTJNqAu2k7Nx7z12AZEGBXBrq",
+    "5CArLgrxQ4GLPuMzb9Y7gYCfvuGotL69b7iTvXVKdv649kM9",
+    "5CG2b2zJdd2sivzb3AEfDyVoEK4aJBtSbuw94ZaLRkMaoY9b",
+    "5CJQPab55wqeCttjiDkwg16b5GR7voxADPu3VHPhVNWV8xEe",
+    "5CJUrDvci5uSJTrN18T7r2YTavkV3FrzmsGsvnaUsrWRJcsT",
+    "5CJs8X2cHSRXSdUKYrCrCcevK5LkmNfiEb55XEgkZNcnFtAD",
+    "5CSZqok1zmt2VBpAqgsFrByLoysbzViF4JJir4jSiHaB3qbz",
+    "5CUyvfyBFJoKJwvAMhnYWet8LvNdcG6K1VsgVrMQevRKfHUw",
+    "5CZhET3dLGyLohLTQsjpMNSVssQ1g88xBoDAEMc9LMukpRDH",
+    "5CiVzdvZCyj2PEit6e7RSnhMVXY5xu3tWX5hNQhgRUbQ1A3L",
+    "5CkzEqsuUVVNW9KaruNgDSwohu2Z3j1HGmoDARGqCJCN5bDS",
+    "5CoXyequMzZrEkkA6MwfMTuxVNXWUr14NGujoa3cdg3EdRub",
+    "5CqkPf821oWrUNTiEjhhWLxnUBXiRf9Jr35bmrWDfB6nqSo3",
+    "5D7nuaXR8Lrctp11GYYMEqckXEKLXLhqxuaEh7vzi6XJGn4D",
+    "5DcbFpyCwLyXm3Xfu5izpp96DxtJefMjQRV5AyRYtDeLffv6",
+    "5DeuvQnD3fFiFpXqEYLc3PgbvLBQKtnqRURpvik8usVS6yup",
+    "5Dh9t36JU9oHSDyJ44XQP7xsDXGeChVZwLHqXUZdtTNagy8B",
+    "5Do6BUVP3WjXe1PKESKXaCQa6afbt1At8gpgJ2THZVZeYxCX",
+    "5DoHgTu9SzA6UzXMHnikoiYfXqGBBzTZofwvKgs34GPW5Q5q",
+    "5E1jXkTmZw3nXfPEJYFuR9yLfkAeB6iLN7Jpy7pTpoWqkeVG",
+    "5E1mJeKatTvGwACF8fy4VaxcjzCSFw3HxSyXYCYaWE7cSDFs",
+    "5E51HuZ8a4eU2VYQfZdeMJWDULo55uxfm9UQ87JxTMsUXk1b",
+    "5E7ND4HnnMYcYHJCfBgrvtQ1P9HaKMGekAWpXvozgK9o4vQX",
+    "5E7vhYAhLgK1HiEJJF161eQHZDxUyu41Rs4uV2vXD678Xj9A",
+    "5EADUbTATkEAR5fUcgjXadU9ogmfMMgneTbMNtqgde6i8qDB",
+    "5EFAp9FRCYf3yweHT2XURVxP4A12nkhmoQpAXmSYz7dw5XhH",
+    "5EKumErdDteNgd8d1tmTYLvAFD7thmXSzLvZTcnR58L1JDqE",
+    "5EM1F7mEnqXNpd29NWaGKjcJcBNXrw2V21zW5wHNiZTUGkUJ",
+    "5ENxR9bSU6SUtrzoaYJTw2TuBYuae4J2g4FLGE5mrn3SHbti",
+    "5EPidbuDHyHZ8VYp78toNrsfUDjnz6W5s6XPgNK42Uh9Y9ta",
+    "5EgrCbU1QDDsJndnXW6h3AdxfQX1TZ32j5ZruA5UN2vr4FbR",
+    "5EpucAdQFp69BsUYfBfVtEuwiqTU7XawirpqUDZkKjMYAdUU",
+    "5Eq9YMcRPjkM3WXXY5ndGKcsfsFfhdgN1cmKDRtRiw2EU9XN",
+    "5EyABxgVHqJfuHPJgtdVCfR59ar9VBcmkKihw9aCKkim84w5",
+    "5F445iMiCMXUjdKRP1VtEPN59n1fAScYmFgULLquHYXq2z3Q",
+    "5F6rXye5FgReC1HpLGmEVcrDHxVLnKPahce93884zday93nw",
+    "5FEeLFMj2J6NpPxNoTC7JauPgF62WwM1ZKGxKk3Ku5NWw1oE",
+    "5FLoBSkmzy7Ab8m1RXUk3XnZBVGNm513XaX89TthD9yMHKmg",
+    "5FWASJ39z6x77RAHeDNWBd8cdY9zBmAVeXrkVDUxadhkb3Hy",
+    "5FWXv1FruZZMyvBNN5QS76aLeJyHbuVaAYGhf8QCZbiotSo4",
+    "5Fe2qtT9rfXobCTMQdQHQRRtXiHf3eurDXcHgzW1SgZNKCGe",
+    "5FeNceWkA6i3NZcPMiosoMm8Xg8JQV2kd8C6qqWsTo4EVX4x",
+    "5FxgJ7PgLKpSm5sKDZv9GCw98txhcJF6FXoBuz83KP62xQVZ",
+    "5G1e9VQ6LejttBRQrZbdiwMw7WamXoSLAMLVnYmS3KvGPrS9",
+    "5G4GaDSzeUTjNmWVgUozJZemz6LwhJZgMro857ZZbG3H1Kc8",
+    "5GHaqTTSkxswM2qierqWktdsQWU6neYVn1es2ikPSXLtCaqt",
+    "5GNxJ6m12jE6B5EiLYn69Gm9bSniKSJcDHasFMccjpBPPY93",
+    "5GTf2GH5fBUacCbhMDXEYcqcYhcKcpxwTY71zVAXVFoty9ta",
+    "5GUFy8ExgLdxc19iujsZ77AMD4EnBc6SKEQxqdpHgG1Vyp9h",
+    "5GW4y7frkK1xWtEVVHbfSVqX7Kn7BFLkAyE8v3Yrx4t9gWyP",
+    "5GbZHx8x1MXfUfYkqFpHESxWvA7ntER8XzxprDW7ZU2Nfmse",
+    "5GcE2NMgHc48gGpR4UQiqDyXuNKLaVeMBrVrfuZovwu8JbLQ",
+    "5GgyWAHE75Jihopn5CoVJN2Atx8ziE4azHjNg7Pg2vukZPXj",
+    "5GhKqFVfu5WtSWGNQM9vShBHQaGGVLsMSo1FUhJgVDCwJNWJ",
+    "5GhUm2HABYgSC3PUyBuKexQ47cT3RBnSsgq7ZVPfRV5H6qNy",
+    "5GjbnhyzsVqqEoTyrGDeeFMDYMQKmEFi4SiMx4BjpBvUdiJp",
+    "5GnMCUJEgu7gjkSGeXh1SjAnfT3hQ8TyC41jDa4KXAij9L7v",
+    "5GvTPBc4STfxQXKEfzHZ9Red5rQeGHPe4uRK7HwsYeoseTRJ",
+    "5Gxhdw5P7pLsBh3ENS4Dhbq9GT7PjxCDBUfZoqgrf7wPxRfH",
+    "5H1m3gqCizC9CQs9YJm7SzQn6annTPFpcVt2BHHUohS7muJe",
+    "5HEq9QZi76QLBWEsoeLaWcR68SBHqRenDMX7drhxCMGqmkqd",
+    "5HGkB6iXTzBRXhmu26dTbjbTvuw2yHQoKSn15xk5PLMYj2kg",
+    "5HGnVLcmPKxAgVq86GRDyKXV4GJnENdiS1auELW8XnP54FcG",
+    "5HNLwiZCrqMBT5pTfUz1DtSzVYWeKkQgGuuQzBVLtf27g2wW",
+    "5HR5Rc32M7aN3bLRbwetwYkL1R8CXfS7vneHxAbBtC98cEwF",
+    "5Hb3gdQBngfuyXj628VECqri2X8XZSdErSFae2bjUB3JYm14",
+    "5Hm9t1qUqQY968Avw4K8W9KgZbrJptBNpybEdhvVw9pKE3Bz",
+    "5C5GPfX1KjgR1YDPBCADcnR28UQy25CJw1tkcQVVvJ7ZPSzr",
+    "5CSkm9JvkqQnTCzUNsEmqWJUiikG5eb9WkztUjcv7LG2rwoh",
+    "5CY5auTcUPvymijZxHReVqNKmHs5qFt3X5MwVy1fweywV4Ay",
+    "5CfFWzKM1AT47SVjRxLa7ksqdjkdCg3bsoBo221zk2WFmBiT",
+    "5CqhdKhL1gDdxYBt3VUCDRJydNKucuuxZ1EHhEBfHo7GQKYh",
+    "5Ct54MJJegsTgK1HbqUpZoAjvpDcoguofvtWUVAkKQeZCdL1",
+    "5CtqLnDkVwVXYKh57Mmak9JqYcdnFaD23FkkFLnAT7hv6Uzb",
+    "5D78MNmvXAgangdayZu3DJtRgJgdN7waddsqWZYf1byzab8R",
+    "5DEykXVkAj8s5ZuX5iiBJa6X1ouQ87dAJRSd6zxcsEDz4BrA",
+    "5DkJ8h2ns7EuU9KWMy93VT4JvpraeChQ1GPHWrEvYVfVFoZH",
+    "5DyGLMtKtroriNA1a6WYKxrhrvKUMY3SbiGBNUtpFQ6U5RER",
+    "5E1Waen8TXTK9a57xmijZD1utoTFMLfPNnbfFkvhEYX29QoX",
+    "5Ec6UgVEBeMiZikciL7VogZXKBY2NJCMNZ1qY2wrLBnvvwFh",
+    "5Ecqhez1dVWUW2i17Wtjdf4X3Bp71etwFXQHPrekCb7D5kpq",
+    "5EpvXL4pMGBtQvZYhiYqqDzJzpQDoQazaQ85vEQFLaYL33FQ",
+    "5F4kovuFSj68khx3UvGqHBu4wdH67Ua7MeeCasTeMcrNd55K",
+    "5FCxLn1oe8rpyovaDMJaDAFnegZ9xf7GHATwfBZiuSZGm8RW",
+    "5G1X1vih425XthcEPWY4HivRrWjvfm3nV4RByL1NGwCeuNxD",
+    "5GZNy3CmgA5aCuZi361vvJBo2UskDtC8KxWr4WvgReq1DL47",
+    "5Gbmes6C8SzSEnN1wuWkwdc7FVFcuaYsyhmH9F1KTXsqnzmr",
+    "5GjUo4VKrjoB8AniH6Yb8gTYrLEiVCK4AfRaKVm8MLL5bdtC",
+    "5Gmrj9E1xpCRr4LyKBEfRu8Av4z6tYoVnrSMUYrtfD6ZZRgv",
+    "5HSsgBxtCZnXxh4gAbbW1dnZHppaJQz5aLMMnhjKardYfEKC",
+    "5HmMQq7C1mbF4RBZnyR8ApkYxPzv9N3DmCMMnLhWurnrgfg8",
 }
 
-SCORE_SCALED_PRIVATE_GROUNDTRUTH_TYPES = {"cricket_delivery", "snooker_ball_state"}
-
-
-def _private_element_weight_share(
+def _inactive_miners_for_element(
+    rows: list[dict[str, float | int | str]],
     *,
-    elem_weight: float,
-    is_private: bool,
-    groundtruth_type: str,
-    winner_score: float,
-) -> float:
-    if not is_private or groundtruth_type not in SCORE_SCALED_PRIVATE_GROUNDTRUTH_TYPES:
-        return float(elem_weight)
-    clamped_score = max(0.0, min(1.0, float(winner_score)))
-    return float(elem_weight) * clamped_score
+    element_id: str,
+    min_shards: int,
+) -> list[dict[str, str | int]]:
+    inactive_miners: list[dict[str, str | int]] = []
+    for row in rows:
+        try:
+            if int(row.get("n_challenges", 0)) <= int(min_shards):
+                continue
+            if float(row.get("avg_score", 0.0) or 0.0) != 0.0:
+                continue
+            hotkey = str(row["hotkey"]).strip()
+            commit_block = int(row["commit_block"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not hotkey:
+            continue
+        inactive_miners.append(
+            {
+                "hotkey": hotkey,
+                "element_id": element_id,
+                "commit_block": commit_block,
+            }
+        )
+    return inactive_miners
 
 
 def _top_rows(
@@ -87,6 +216,7 @@ def _top_rows(
     min_samples: int,
     max_samples: int | None = None,
     top_k: int = 3,
+    min_avg_score: float = 1e-12,
 ) -> list[dict[str, float | int | str]]:
     selected: list[dict[str, float | int | str]] = []
     for row in rows:
@@ -95,17 +225,81 @@ def _top_rows(
             continue
         if max_samples is not None and n > max_samples:
             continue
+        if float(row.get("avg_score", 0.0) or 0.0) <= min_avg_score:
+            continue
         selected.append(row)
-    selected.sort(key=lambda r: (float(r["avg_score"]), int(r["n_challenges"])), reverse=True)
+    selected.sort(
+        key=lambda r: (
+            -float(r["avg_score"]),
+            -int(r["n_challenges"]),
+            int(r.get("uid", 0)),
+        )
+    )
     return selected[: max(0, int(top_k))]
+
+
+def _commit_block_for_hotkey(
+    rows: list[dict[str, float | int | str]],
+    hotkey: str | None,
+) -> int | None:
+    wanted_hotkey = str(hotkey or "").strip()
+    if not wanted_hotkey:
+        return None
+    for row in rows:
+        if str(row.get("hotkey") or "").strip() != wanted_hotkey:
+            continue
+        try:
+            return int(row["commit_block"])
+        except (KeyError, TypeError, ValueError):
+            return None
+    return None
+
+
+def _ranked_private_rows(
+    rows: list[dict[str, float | int | str]],
+    *,
+    min_samples: int,
+) -> list[dict[str, float | int | str]]:
+    positive_rows = [
+        row
+        for row in rows
+        if abs(float(row.get("avg_score", 0.0) or 0.0)) > 1e-12
+    ]
+    top_rows = _top_rows(
+        positive_rows,
+        min_samples=min_samples,
+        top_k=len(PRIVATE_TRACK_RANKED_WEIGHT_SHARES),
+    )
+    ranked_rows: list[dict[str, float | int | str]] = []
+    for idx, row in enumerate(top_rows):
+        ranked = dict(row)
+        ranked["rank"] = idx + 1
+        ranked["weight_share"] = PRIVATE_TRACK_RANKED_WEIGHT_SHARES[idx]
+        ranked_rows.append(ranked)
+    return ranked_rows
+
+
+def _private_ranked_weight_allocations(
+    rows: list[dict[str, float | int | str]],
+    *,
+    elem_weight: float,
+    min_samples: int,
+) -> list[tuple[int, float, dict[str, float | int | str]]]:
+    allocations: list[tuple[int, float, dict[str, float | int | str]]] = []
+    for idx, row in enumerate(_ranked_private_rows(rows, min_samples=min_samples)):
+        try:
+            uid = int(row["uid"])
+        except Exception:
+            continue
+        share = float(elem_weight) * PRIVATE_TRACK_RANKED_WEIGHT_SHARES[idx]
+        allocations.append((uid, share, row))
+    return allocations
 
 
 @lru_cache(maxsize=1)
 def get_validator_hotkey_ss58() -> str:
-    import bittensor as bt
-
     settings = get_settings()
-    wallet = bt.wallet(
+    wallet = bt.Wallet(
         name=settings.BITTENSOR_WALLET_COLD,
         hotkey=settings.BITTENSOR_WALLET_HOT,
     )
@@ -269,9 +463,7 @@ async def weights_loop(
     if commit_on_start:
         await commit_validator_on_start(netuid)
 
-    import bittensor as bt
-
-    wallet = bt.wallet(
+    wallet = bt.Wallet(
         name=settings.BITTENSOR_WALLET_COLD,
         hotkey=settings.BITTENSOR_WALLET_HOT,
     )
@@ -301,6 +493,12 @@ async def weights_loop(
             blacklisted_hotkeys = await fetch_blacklisted_hotkeys(blacklist_api)
             if blacklisted_hotkeys:
                 logger.info("[weights] loaded %d blacklisted hotkeys", len(blacklisted_hotkeys))
+            compliance_failure_tuples = await fetch_compliance_failure_tuples()
+            if compliance_failure_tuples:
+                logger.info(
+                    "[weights] loaded %d compliance failing tuple(s)",
+                    len(compliance_failure_tuples),
+                )
 
             if subtensor is None:
                 subtensor = await get_subtensor()
@@ -375,6 +573,9 @@ async def weights_loop(
 
                 weights_by_uid: dict[int, float] = {}
                 winners_by_element: dict[str, dict[str, str | None]] = {}
+                inactive_miners_by_tuple: dict[
+                    tuple[str, str, int], dict[str, str | int]
+                ] = {}
                 max_tail_used = effective_tail
 
                 total_elem_weight = sum(max(0.0, w) for _eid, w, _ew, _t in elements)
@@ -393,7 +594,7 @@ async def weights_loop(
                         is_private = track == "private"
                         if is_private:
                             tail_from_eval = days_to_blocks(eval_window_days)
-                            tail_for_element = tail_from_eval if tail_from_eval is not None else effective_tail
+                            tail_for_element = tail_from_eval if tail_from_eval is not None else public_tail_blocks
                         else:
                             tail_for_element = public_tail_blocks
                         max_tail_used = max(max_tail_used, tail_for_element)
@@ -420,7 +621,7 @@ async def weights_loop(
 
                         lane = "private" if is_private else "public"
                         min_samples = private_min_samples if is_private else public_min_samples
-                        winner_uid, winner_scores_by_uid, winner_meta, sample_rows_all = await get_winner_for_element(
+                        winner_uid, _winner_scores_by_uid, winner_meta, sample_rows_all = await get_winner_for_element(
                             element_id=element_id,
                             current_window_id=current_window_id,
                             tail=tail_for_element,
@@ -428,53 +629,71 @@ async def weights_loop(
                             baseline_theta=baseline_theta,
                             first_block=first_block,
                             blacklisted_hotkeys=blacklisted_hotkeys,
+                            compliance_failure_tuples=None if is_private else compliance_failure_tuples,
                             validator_hotkey_ss58=validator_hotkey_ss58,
                             lane=lane,
                         )
+
+                        for inactive_miner in _inactive_miners_for_element(
+                            sample_rows_all,
+                            element_id=element_id,
+                            min_shards=(
+                                PRIVATE_INACTIVE_MIN_SHARDS
+                                if is_private
+                                else PUBLIC_INACTIVE_MIN_SHARDS
+                            ),
+                        ):
+                            inactive_key = (
+                                str(inactive_miner["hotkey"]),
+                                str(inactive_miner["element_id"]),
+                                int(inactive_miner["commit_block"]),
+                            )
+                            inactive_miners_by_tuple[inactive_key] = inactive_miner
 
                         if winner_uid is None:
                             logger.warning("[weights] No winner for element_id=%s", element_id)
                             continue
 
-                        raw_groundtruth_type = getattr(elem, "groundtruth_type", None) if elem is not None else None
-                        if hasattr(raw_groundtruth_type, "value"):
-                            groundtruth_type = str(raw_groundtruth_type.value or "").strip().lower()
+                        private_ranked_rows: list[dict[str, float | int | str]] = []
+                        if is_private:
+                            ranked_allocations = _private_ranked_weight_allocations(
+                                sample_rows_all,
+                                elem_weight=float(elem_weight),
+                                min_samples=min_samples,
+                            )
+                            private_ranked_rows = [row for _uid, _share, row in ranked_allocations]
+                            if ranked_allocations:
+                                for ranked_uid, ranked_share, ranked_row in ranked_allocations:
+                                    weights_by_uid[ranked_uid] = weights_by_uid.get(ranked_uid, 0.0) + ranked_share
+                                    logger.info(
+                                        "[weights] Private element=%s rank=%d uid=%d elem_weight=%.6f rank_share=%.2f share=%.6f",
+                                        element_id,
+                                        int(ranked_row["rank"]),
+                                        ranked_uid,
+                                        elem_weight,
+                                        float(ranked_row["weight_share"]),
+                                        ranked_share,
+                                    )
+                            else:
+                                share = float(elem_weight)
+                                weights_by_uid[winner_uid] = weights_by_uid.get(winner_uid, 0.0) + share
+                                logger.warning(
+                                    "[weights] Private element=%s has no ranked eligible rows; assigning full elem_weight=%.6f to winner_uid=%d",
+                                    element_id,
+                                    elem_weight,
+                                    winner_uid,
+                                )
                         else:
-                            groundtruth_type = str(raw_groundtruth_type or "").strip().lower()
-                        winner_score_raw = float(winner_scores_by_uid.get(winner_uid, 0.0) or 0.0)
-                        share = _private_element_weight_share(
-                            elem_weight=elem_weight,
-                            is_private=is_private,
-                            groundtruth_type=groundtruth_type,
-                            winner_score=winner_score_raw,
-                        )
-                        if is_private and groundtruth_type in SCORE_SCALED_PRIVATE_GROUNDTRUTH_TYPES:
+                            share = float(elem_weight)
+                            weights_by_uid[winner_uid] = weights_by_uid.get(winner_uid, 0.0) + share
                             logger.info(
-                                "[weights] Score-scaled private weighting enabled element=%s groundtruth_type=%s winner_uid=%d elem_weight=%.6f winner_score=%.6f share=%.6f",
+                                "[weights] Element=%s winner_uid=%d elem_weight=%.6f share=%.6f",
                                 element_id,
-                                groundtruth_type,
                                 winner_uid,
                                 elem_weight,
-                                max(0.0, min(1.0, winner_score_raw)),
                                 share,
                             )
-                        elif is_private:
-                            logger.info(
-                                "[weights] Private element=%s not in cricket weighting mode (groundtruth_type=%s)",
-                                element_id,
-                                groundtruth_type or "<empty>",
-                            )
-
-                        weights_by_uid[winner_uid] = weights_by_uid.get(winner_uid, 0.0) + share
-
-                        logger.info(
-                            "[weights] Element=%s winner_uid=%d elem_weight=%.6f share=%.6f",
-                            element_id,
-                            winner_uid,
-                            elem_weight,
-                            share,
-                        )
-                        if winner_meta and winner_meta.get("hotkey"):
+                        if (winner_meta and winner_meta.get("hotkey")) or private_ranked_rows:
                             top_3_official = _top_rows(
                                 sample_rows_all,
                                 min_samples=min_samples,
@@ -486,13 +705,35 @@ async def weights_loop(
                                 max_samples=29,
                                 top_k=3,
                             )
-                            winners_by_element[element_id] = {
-                                "winner_hotkey": winner_meta.get("hotkey"),
-                                "chute_id": winner_meta.get("chute_id"),
-                                "slug": winner_meta.get("slug"),
+                            if is_private and private_ranked_rows:
+                                snapshot_winner_hotkey = str(private_ranked_rows[0].get("hotkey") or "").strip()
+                                snapshot_chute_id = None
+                                snapshot_slug = None
+                                if winner_meta and winner_meta.get("hotkey") == snapshot_winner_hotkey:
+                                    snapshot_chute_id = winner_meta.get("chute_id")
+                                    snapshot_slug = winner_meta.get("slug")
+                            else:
+                                snapshot_winner_hotkey = winner_meta.get("hotkey") if winner_meta else None
+                                snapshot_chute_id = winner_meta.get("chute_id") if winner_meta else None
+                                snapshot_slug = winner_meta.get("slug") if winner_meta else None
+                            snapshot_commit_block = _commit_block_for_hotkey(
+                                sample_rows_all,
+                                snapshot_winner_hotkey,
+                            )
+                            winner_entry = {
+                                "winner_hotkey": snapshot_winner_hotkey,
+                                "winner_commit_block": snapshot_commit_block,
+                                "chute_id": snapshot_chute_id,
+                                "slug": snapshot_slug,
                                 "top_3_official": top_3_official,
                                 "top_3_watchlist": top_3_watchlist,
                             }
+                            if is_private:
+                                for idx in range(len(PRIVATE_TRACK_RANKED_WEIGHT_SHARES)):
+                                    winner_entry[f"winner_{idx + 1}"] = (
+                                        private_ranked_rows[idx] if idx < len(private_ranked_rows) else None
+                                    )
+                            winners_by_element[element_id] = winner_entry
 
                 if blacklisted_hotkeys:
                     try:
@@ -541,22 +782,42 @@ async def weights_loop(
                     VALIDATOR_LOOP_TOTAL.labels(outcome="success").inc()
                     VALIDATOR_LAST_BLOCK_SUCCESS.set(block)
                     logger.info("set_weights OK at block %d", block)
-                    if is_central_validator and winners_by_element:
-                        payload = {
-                            "block": block,
-                            "window_id": current_window_id,
-                            "netuid": settings.SCOREVISION_NETUID,
-                            "mechid": settings.SCOREVISION_MECHID,
-                            "winners": winners_by_element,
-                        }
-                        timeout_s = float(os.getenv("SV_R2_TIMEOUT_S", "60"))
+                    timeout_s = float(os.getenv("SV_R2_TIMEOUT_S", "60"))
+                    if is_central_validator:
+                        if winners_by_element:
+                            payload = {
+                                "block": block,
+                                "window_id": current_window_id,
+                                "netuid": settings.SCOREVISION_NETUID,
+                                "mechid": settings.SCOREVISION_MECHID,
+                                "winners": winners_by_element,
+                            }
+                            try:
+                                key = await asyncio.wait_for(put_winners_snapshot(block, payload), timeout=timeout_s)
+                                logger.info("[weights] winners snapshot stored: %s", key)
+                            except asyncio.TimeoutError:
+                                logger.warning("[weights] winners snapshot timed out")
+                            except Exception as e:
+                                logger.warning("[weights] winners snapshot failed: %s", e)
+
+                        inactive_miners = [
+                            inactive_miners_by_tuple[key]
+                            for key in sorted(inactive_miners_by_tuple)
+                        ]
                         try:
-                            key = await asyncio.wait_for(put_winners_snapshot(block, payload), timeout=timeout_s)
-                            logger.info("[weights] winners snapshot stored: %s", key)
+                            key = await asyncio.wait_for(
+                                put_inactive_miners(inactive_miners),
+                                timeout=timeout_s,
+                            )
+                            logger.info(
+                                "[weights] inactive miners stored: %s (count=%d)",
+                                key,
+                                len(inactive_miners),
+                            )
                         except asyncio.TimeoutError:
-                            logger.warning("[weights] winners snapshot timed out")
+                            logger.warning("[weights] inactive miners upload timed out")
                         except Exception as e:
-                            logger.warning("[weights] winners snapshot failed: %s", e)
+                            logger.warning("[weights] inactive miners upload failed: %s", e)
                 else:
                     logger.warning("set_weights failed at block %d", block)
                     VALIDATOR_LOOP_TOTAL.labels(outcome="set_weights_failed").inc()
